@@ -47,8 +47,8 @@ export class MFTMCPServer {
             type: 'object',
             properties: {
               driveLetter: { type: 'string', description: 'Drive letter (e.g., "C")' },
-              includeHidden: { type: 'boolean', default: false },
-              includeSystem: { type: 'boolean', default: false },
+              includeHidden: { type: 'boolean', default: true, description: 'Index hidden files (default true)' },
+              includeSystem: { type: 'boolean', default: true, description: 'Index system files such as hiberfil.sys and pagefile.sys (default true)' },
               batchSize: { type: 'number', default: 1000 },
             },
             required: ['driveLetter'],
@@ -209,7 +209,8 @@ export class MFTMCPServer {
           contents: [{
             uri,
             mimeType: 'application/json',
-            text: JSON.stringify(drives, null, 2),
+            // JSON.stringify cannot serialize bigint; sizes are emitted as decimal strings.
+            text: JSON.stringify(drives, (_key, value) => (typeof value === 'bigint' ? value.toString() : value), 2),
           }],
         };
       }

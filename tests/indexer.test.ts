@@ -2,7 +2,10 @@ import { MFTIndexer } from '../src/mft/indexer';
 import { IndexOptions } from '../src/mft/types';
 import { LONG_NAME, makeFakeVolume } from './fake-volume';
 
-function makeIndexer(options: IndexOptions = {}) {
+// Most fixtures below assume hidden/system files are excluded; the defaults are tested separately.
+const EXCLUDE: IndexOptions = { includeHidden: false, includeSystem: false };
+
+function makeIndexer(options: IndexOptions = EXCLUDE) {
   const fake = makeFakeVolume();
   const indexer = new MFTIndexer('c', options, { openParser: () => fake.parser(), dbPath: ':memory:' });
   return { ...fake, indexer };
@@ -16,7 +19,23 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
     expect(indexer.getStats()).toBeNull();
   });
 
-  it('indexes with correct counts and sizes (hidden/system files excluded by default)', async () => {
+  it('indexes hidden and system files by default (hiberfil.sys, pagefile.sys, $MFT, ...)', async () => {
+    const { indexer } = makeIndexer({});
+    const stats = await indexer.index();
+    expect(stats.totalFiles).toBe(9); // + hidden.dat (hidden) and $MFT (hidden+system)
+    expect(stats.totalSize).toBe(5_000_132n + 7n + 81_920n);
+    expect(paths(indexer.search('hidden.dat'))).toEqual(['C:\\Users\\hidden.dat']);
+    expect(paths(indexer.search('$MFT'))).toEqual(['C:\\$MFT']);
+  });
+
+  it('can exclude hidden and/or system files on request', async () => {
+    const onlySystemOut = makeIndexer({ includeSystem: false });
+    expect((await onlySystemOut.indexer.index()).totalFiles).toBe(8); // $MFT (system) gone, hidden.dat stays
+    const onlyHiddenOut = makeIndexer({ includeHidden: false });
+    expect((await onlyHiddenOut.indexer.index()).totalFiles).toBe(7); // $MFT is hidden too, so both gone
+  });
+
+  it('indexes with correct counts and sizes (hidden/system files excluded when asked)', async () => {
     const { indexer, mem } = makeIndexer();
     const stats = await indexer.index();
     expect(stats.driveLetter).toBe('C');
@@ -117,7 +136,7 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
   });
 
   it('emits start/progress/complete events', async () => {
-    const { indexer } = makeIndexer({ batchSize: 3 });
+    const { indexer } = makeIndexer({ ...EXCLUDE, batchSize: 3 });
     const events: string[] = [];
     indexer.on('start', () => events.push('start'));
     indexer.on('progress', () => events.push('progress'));

@@ -18,8 +18,8 @@ program
   .command('index')
   .description('Index a drive using MFT')
   .argument('<driveLetter>', 'Drive letter (e.g., C)')
-  .option('-H, --hidden', 'Include hidden files', false)
-  .option('-s, --system', 'Include system files', false)
+  .option('--no-hidden', 'Exclude files with the Hidden attribute')
+  .option('--no-system', 'Exclude files with the System attribute (hiberfil.sys, pagefile.sys, ...)')
   .option('-b, --batch-size <number>', 'Batch size for indexing', '1000')
   .action(async (driveLetter, options) => {
     const spinner = ora(`Indexing ${driveLetter}:...`).start();

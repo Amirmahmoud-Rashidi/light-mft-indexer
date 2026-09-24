@@ -56,7 +56,7 @@ search tools work from the index and return a clear error if the drive has not b
 
 | Tool | Purpose |
 |------|---------|
-| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator) |
+| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator). Hidden and system files (`hiberfil.sys`, `pagefile.sys`, `$MFT`, ...) are included by default; pass `includeHidden: false` / `includeSystem: false` to skip them (CLI: `--no-hidden`, `--no-system`) |
 | `search_files` | Name search (case-insensitive substring). A query containing `\` or `/` is matched against the full path |
 | `search_by_size` / `search_by_date` | Range searches |
 | `get_largest_files` / `get_largest_directories` | Top-N by size (directories are recursive) |

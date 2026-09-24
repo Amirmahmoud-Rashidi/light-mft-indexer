@@ -54,8 +54,10 @@ export class MFTIndexer extends EventEmitter {
     super();
     this.driveLetter = normalizeDriveLetter(driveLetter);
     this.options = {
-      includeHidden: false,
-      includeSystem: false,
+      // A disk-usage index must contain everything (hiberfil.sys, pagefile.sys, swapfile.sys, $MFT, ... are
+      // hidden+system files). Callers can opt out.
+      includeHidden: true,
+      includeSystem: true,
       batchSize: 1000,
       ...options,
       driveLetter: this.driveLetter,

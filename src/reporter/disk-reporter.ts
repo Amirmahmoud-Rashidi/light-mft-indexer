@@ -28,8 +28,8 @@ export class DiskReporter {
           letter: drive.replace(':', ''),
           type: typeStr,
           totalSpace: space.totalBytes,
-          freeSpace: space.freeBytes,
-          usedSpace: space.totalBytes - space.freeBytes,
+          freeSpace: space.totalFreeBytes,
+          usedSpace: space.totalBytes - space.totalFreeBytes,
         });
       } catch {
         drives.push({

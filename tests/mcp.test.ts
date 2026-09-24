@@ -21,7 +21,7 @@ describe('MCP server', () => {
 
     // Pre-build the C: index from the synthetic volume (as index_drive would on Windows).
     const fake = makeFakeVolume();
-    const seed = new MFTIndexer('C', {}, { openParser: () => fake.parser(), dbPath: getIndexDbPath('C') });
+    const seed = new MFTIndexer('C', { includeHidden: false, includeSystem: false }, { openParser: () => fake.parser(), dbPath: getIndexDbPath('C') });
     await seed.index();
     seed.close();
 
@@ -45,6 +45,18 @@ describe('MCP server', () => {
       'get_disk_usage', 'get_index_stats', 'get_largest_directories', 'get_largest_files',
       'index_drive', 'list_drives', 'search_by_date', 'search_by_size', 'search_files',
     ]);
+  });
+
+  it('exposes the mft://drives resource with bigint sizes serialized as strings', async () => {
+    const reporter = (server as any).diskReporter;
+    const spy = jest.spyOn(reporter, 'getDrives').mockReturnValue([
+      { letter: 'C', type: 'Fixed', totalSpace: 500_000_000_000n, freeSpace: 120_000_000_000n, usedSpace: 380_000_000_000n },
+    ]);
+    expect((await client.listResources()).resources.map((r) => r.uri)).toEqual(['mft://drives']);
+    const res: any = await client.readResource({ uri: 'mft://drives' });
+    const drives = JSON.parse(res.contents[0].text);
+    expect(drives).toEqual([{ letter: 'C', type: 'Fixed', totalSpace: '500000000000', freeSpace: '120000000000', usedSpace: '380000000000' }]);
+    spy.mockRestore();
   });
 
   it('search_files returns full paths', async () => {

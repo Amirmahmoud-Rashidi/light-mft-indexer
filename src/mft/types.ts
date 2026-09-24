@@ -211,7 +211,9 @@ export interface BootSector {
 
 export interface IndexOptions {
   driveLetter?: string;
+  /** Index files with the Hidden attribute (default: true). */
   includeHidden?: boolean;
+  /** Index files with the System attribute, e.g. hiberfil.sys, pagefile.sys, $MFT (default: true). */
   includeSystem?: boolean;
   maxDepth?: number;
   followJunctions?: boolean;
