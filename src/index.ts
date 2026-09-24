@@ -1,6 +1,6 @@
-// Main entry point
-export * from './mft';
-export * from './vector';
-export * from './mcp';
-export * from './reporter';
-export * from './cli';
+// MFT Module - Main exports
+export * from './types';
+export * from './drive';
+export * from './win32';
+export * from './parser';
+export * from './indexer';

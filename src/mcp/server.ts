@@ -1,22 +1,21 @@
 // MCP Server - Model Context Protocol server for file operations
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { MFTIndexer, createIndexer } from '../mft';
-import { VectorDatabase, createVectorDatabase } from '../vector';
+import { MFTIndexer, createIndexer } from '../mft/indexer';
+import { normalizeDriveLetter } from '../mft/drive';
+import { IndexOptions, MFTRecord } from '../mft/types';
 import { DiskReporter, createDiskReporter } from '../reporter';
-import { IndexOptions, SearchQuery, DiskUsage } from '../mft/types';
-import * as path from 'path';
 
 export class MFTMCPServer {
   private server: Server;
   private indexers: Map<string, MFTIndexer> = new Map();
-  private vectorDbs: Map<string, VectorDatabase> = new Map();
   private diskReporter: DiskReporter;
 
   constructor() {
@@ -43,7 +42,7 @@ export class MFTMCPServer {
       tools: [
         {
           name: 'index_drive',
-          description: 'Index a drive using MFT for fast file discovery',
+          description: 'Index an NTFS drive by reading its MFT (needs Administrator rights; can take from seconds to a few minutes). Must be run once before any search on that drive.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -143,20 +142,6 @@ export class MFTMCPServer {
           },
         },
         {
-          name: 'semantic_search',
-          description: 'Semantic search using vector embeddings',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              driveLetter: { type: 'string' },
-              query: { type: 'string' },
-              limit: { type: 'number', default: 10 },
-              threshold: { type: 'number', default: 0.3 },
-            },
-            required: ['driveLetter', 'query'],
-          },
-        },
-        {
           name: 'list_drives',
           description: 'List all available drives',
           inputSchema: {
@@ -189,8 +174,6 @@ export class MFTMCPServer {
             return await this.handleGetDiskUsage(args);
           case 'get_index_stats':
             return await this.handleGetIndexStats(args);
-          case 'semantic_search':
-            return await this.handleSemanticSearch(args);
           case 'list_drives':
             return await this.handleListDrives();
           default:
@@ -236,169 +219,130 @@ export class MFTMCPServer {
   }
 
   private getOrCreateIndexer(driveLetter: string, options?: IndexOptions): MFTIndexer {
-    const key = driveLetter.toUpperCase();
-    if (!this.indexers.has(key)) {
-      this.indexers.set(key, createIndexer(key, options));
+    const key = normalizeDriveLetter(driveLetter);
+    let indexer = this.indexers.get(key);
+    if (!indexer) {
+      indexer = createIndexer(key, options);
+      this.indexers.set(key, indexer);
     }
-    return this.indexers.get(key)!;
+    return indexer;
   }
 
-  private getOrCreateVectorDb(driveLetter: string): VectorDatabase {
-    const key = driveLetter.toUpperCase();
-    if (!this.vectorDbs.has(key)) {
-      const dbPath = path.join(process.cwd(), `.mft-vector-${key}.db`);
-      this.vectorDbs.set(key, createVectorDatabase({
-        dimensions: 384,
-        indexPath: dbPath,
-      }));
+  /** Indexer for a drive that must already have been indexed (search tools never need Administrator). */
+  private getIndexedIndexer(driveLetter: string): MFTIndexer {
+    const indexer = this.getOrCreateIndexer(driveLetter);
+    if (!indexer.hasIndex()) {
+      throw new Error(
+        `Drive ${normalizeDriveLetter(driveLetter)}: has not been indexed yet. Run the index_drive tool first (requires Administrator).`
+      );
     }
-    return this.vectorDbs.get(key)!;
+    return indexer;
+  }
+
+  private text(text: string) {
+    return { content: [{ type: 'text' as const, text }] };
+  }
+
+  private formatRecord(r: MFTRecord): string {
+    const kind = (r.flags & 0x02) !== 0 ? '[DIR] ' : '';
+    const size = (r.flags & 0x02) !== 0 ? '' : ` (${this.formatBytes(r.realSize)})`;
+    return `${kind}${r.fullPath ?? r.fileName}${size} - modified ${r.modificationTime.toISOString()}`;
   }
 
   private async handleIndexDrive(args: any) {
     const { driveLetter, includeHidden, includeSystem, batchSize } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter, { includeHidden, includeSystem, batchSize });
-    
-    const stats = await indexer.index();
-    
-    // Also populate vector database
-    const vectorDb = this.getOrCreateVectorDb(driveLetter);
-    // Note: In a real implementation, you'd iterate through indexed files and add to vector DB
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Indexing complete for ${driveLetter}:\n` +
-              `Files: ${stats.totalFiles.toLocaleString()}\n` +
-              `Directories: ${stats.totalDirectories.toLocaleString()}\n` +
-              `Total Size: ${this.formatBytes(stats.totalSize)}\n` +
-              `Duration: ${stats.duration}ms\n` +
-              `Indexed at: ${stats.indexedAt.toISOString()}`,
-      }],
-    };
+    const indexer = this.getOrCreateIndexer(driveLetter);
+    const stats = await indexer.index({ includeHidden, includeSystem, batchSize });
+
+    return this.text(
+      `Indexing complete for ${stats.driveLetter}:\n` +
+        `Files: ${stats.totalFiles.toLocaleString()}\n` +
+        `Directories: ${stats.totalDirectories.toLocaleString()}\n` +
+        `Total Size: ${this.formatBytes(stats.totalSize)}\n` +
+        `Duration: ${stats.duration}ms\n` +
+        `Indexed at: ${stats.indexedAt.toISOString()}`
+    );
   }
 
   private async handleSearchFiles(args: any) {
     const { driveLetter, query, limit } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const results = indexer.search(query, limit);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Found ${results.length} files matching "${query}":\n\n` +
-              results.map(r => `${r.fileName} (${this.formatBytes(r.realSize)}) - ${r.modificationTime.toISOString()}`).join('\n'),
-      }],
-    };
+    const results = this.getIndexedIndexer(driveLetter).search(String(query), limit);
+    return this.text(`Found ${results.length} entries matching "${query}":\n\n` + results.map((r) => this.formatRecord(r)).join('\n'));
   }
 
   private async handleSearchBySize(args: any) {
     const { driveLetter, minSize, maxSize, limit } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const results = indexer.searchBySize(BigInt(minSize), BigInt(maxSize), limit);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Found ${results.length} files between ${this.formatBytes(BigInt(minSize))} and ${this.formatBytes(BigInt(maxSize))}:\n\n` +
-              results.map(r => `${r.fileName} (${this.formatBytes(r.realSize)}) - ${r.modificationTime.toISOString()}`).join('\n'),
-      }],
-    };
+    const results = this.getIndexedIndexer(driveLetter).searchBySize(BigInt(minSize), BigInt(maxSize), limit);
+    return this.text(
+      `Found ${results.length} files between ${this.formatBytes(BigInt(minSize))} and ${this.formatBytes(BigInt(maxSize))}:\n\n` +
+        results.map((r) => this.formatRecord(r)).join('\n')
+    );
   }
 
   private async handleSearchByDate(args: any) {
     const { driveLetter, after, before, limit } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const results = indexer.searchByDate(new Date(after), new Date(before), limit);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Found ${results.length} files modified between ${after} and ${before}:\n\n` +
-              results.map(r => `${r.fileName} (${this.formatBytes(r.realSize)}) - ${r.modificationTime.toISOString()}`).join('\n'),
-      }],
-    };
+    const results = this.getIndexedIndexer(driveLetter).searchByDate(new Date(after), new Date(before), limit);
+    return this.text(
+      `Found ${results.length} entries modified between ${after} and ${before}:\n\n` +
+        results.map((r) => this.formatRecord(r)).join('\n')
+    );
   }
 
   private async handleGetLargestFiles(args: any) {
     const { driveLetter, limit } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const results = indexer.getLargestFiles(limit);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Top ${results.length} largest files on ${driveLetter}:\n\n` +
-              results.map((r, i) => `${i + 1}. ${r.fileName} - ${this.formatBytes(r.realSize)} - ${r.modificationTime.toISOString()}`).join('\n'),
-      }],
-    };
+    const results = this.getIndexedIndexer(driveLetter).getLargestFiles(limit);
+    return this.text(
+      `Top ${results.length} largest files on ${normalizeDriveLetter(driveLetter)}:\n\n` +
+        results.map((r, i) => `${i + 1}. ${r.fullPath} - ${this.formatBytes(r.realSize)} - ${r.modificationTime.toISOString()}`).join('\n')
+    );
   }
 
   private async handleGetLargestDirectories(args: any) {
     const { driveLetter, limit } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const results = indexer.getLargestDirectories(limit);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Top ${results.length} largest directories on ${driveLetter}:\n\n` +
-              results.map((r, i) => `${i + 1}. Record ${r.record_number} - ${this.formatBytes(BigInt(r.total_size))} - ${r.file_count} files`).join('\n'),
-      }],
-    };
+    const results = this.getIndexedIndexer(driveLetter).getLargestDirectories(limit);
+    return this.text(
+      `Top ${results.length} largest directories on ${normalizeDriveLetter(driveLetter)} (recursive size):\n\n` +
+        results.map((r, i) => `${i + 1}. ${r.path} - ${this.formatBytes(r.size)} - ${r.fileCount.toLocaleString()} files`).join('\n')
+    );
   }
 
   private async handleGetDiskUsage(args: any) {
     const { driveLetter } = args;
     const usage = this.diskReporter.getDiskUsage(driveLetter);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Disk Usage for ${driveLetter}:\n\n` +
-              `Total Space: ${this.formatBytes(usage.totalSpace)}\n` +
-              `Used Space: ${this.formatBytes(usage.usedSpace)} (${usage.usagePercent.toFixed(1)}%)\n` +
-              `Free Space: ${this.formatBytes(usage.freeSpace)}\n` +
-              `Files: ${usage.fileCount.toLocaleString()}\n` +
-              `Directories: ${usage.directoryCount.toLocaleString()}\n\n` +
-              `Largest Files:\n` +
-              usage.largestFiles.slice(0, 10).map((f, i) => `${i + 1}. ${f.path} - ${this.formatBytes(f.size)}`).join('\n') + '\n\n' +
-              `Largest Directories:\n` +
-              usage.largestDirectories.slice(0, 10).map((d, i) => `${i + 1}. ${d.path} - ${this.formatBytes(d.size)} (${d.fileCount} files)`).join('\n'),
-      }],
-    };
+    const indexer = this.getOrCreateIndexer(driveLetter);
+    const stats = indexer.hasIndex() ? indexer.getStats() : null;
+
+    let out =
+      `Disk Usage for ${usage.driveLetter}:\n\n` +
+      `Total Space: ${this.formatBytes(usage.totalSpace)}\n` +
+      `Used Space: ${this.formatBytes(usage.usedSpace)} (${usage.usagePercent.toFixed(1)}%)\n` +
+      `Free Space: ${this.formatBytes(usage.freeSpace)}\n`;
+
+    if (stats) {
+      out +=
+        `Files: ${stats.totalFiles.toLocaleString()}\n` +
+        `Directories: ${stats.totalDirectories.toLocaleString()}\n\n` +
+        `Largest Files:\n` +
+        indexer.getLargestFiles(10).map((f, i) => `${i + 1}. ${f.fullPath} - ${this.formatBytes(f.realSize)}`).join('\n') + '\n\n' +
+        `Largest Directories:\n` +
+        indexer.getLargestDirectories(10).map((d, i) => `${i + 1}. ${d.path} - ${this.formatBytes(d.size)} (${d.fileCount.toLocaleString()} files)`).join('\n');
+    } else {
+      out += `\n(Drive not indexed yet - run index_drive to also get file counts and the largest files/directories.)`;
+    }
+    return this.text(out);
   }
 
   private async handleGetIndexStats(args: any) {
     const { driveLetter } = args;
-    const indexer = this.getOrCreateIndexer(driveLetter);
-    const stats = indexer.getStats();
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Index Statistics for ${driveLetter}:\n\n` +
-              `Total Files: ${stats.totalFiles.toLocaleString()}\n` +
-              `Total Directories: ${stats.totalDirectories.toLocaleString()}\n` +
-              `Total Size: ${this.formatBytes(stats.totalSize)}\n` +
-              `Indexed At: ${stats.indexedAt.toISOString()}\n` +
-              `Duration: ${stats.duration}ms`,
-      }],
-    };
-  }
-
-  private async handleSemanticSearch(args: any) {
-    const { driveLetter, query, limit, threshold } = args;
-    const vectorDb = this.getOrCreateVectorDb(driveLetter);
-    const results = await vectorDb.search(query, limit, threshold);
-    
-    return {
-      content: [{
-        type: 'text',
-        text: `Semantic search results for "${query}" (threshold: ${threshold}):\n\n` +
-              results.map((r, i) => `${i + 1}. ${r.fileName} (${(r.score * 100).toFixed(1)}%) - ${r.fullPath}`).join('\n'),
-      }],
-    };
+    const stats = this.getIndexedIndexer(driveLetter).getStats()!;
+    return this.text(
+      `Index Statistics for ${stats.driveLetter}:\n\n` +
+        `Total Files: ${stats.totalFiles.toLocaleString()}\n` +
+        `Total Directories: ${stats.totalDirectories.toLocaleString()}\n` +
+        `Total Size: ${this.formatBytes(stats.totalSize)}\n` +
+        `Indexed At: ${stats.indexedAt.toISOString()}\n` +
+        `Duration: ${stats.duration}ms`
+    );
   }
 
   private async handleListDrives() {
@@ -422,8 +366,8 @@ export class MFTMCPServer {
     return `${(num / (1024 * 1024 * 1024 * 1024)).toFixed(1)} TB`;
   }
 
-  async start(): Promise<void> {
-    const transport = new StdioServerTransport();
+  /** Start serving. Defaults to stdio (what MCP hosts use); tests pass an in-memory transport. */
+  async start(transport: Transport = new StdioServerTransport()): Promise<void> {
     await this.server.connect(transport);
     console.error('MFT Indexer MCP Server started');
   }
@@ -432,13 +376,23 @@ export class MFTMCPServer {
     for (const indexer of this.indexers.values()) {
       indexer.close();
     }
-    for (const vectorDb of this.vectorDbs.values()) {
-      vectorDb.close();
-    }
     await this.server.close();
   }
 }
 
 export function createMCPServer(): MFTMCPServer {
   return new MFTMCPServer();
+}
+
+if (require.main === module) {
+  const server = createMCPServer();
+  const shutdown = () => {
+    server.stop().finally(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  server.start().catch((error) => {
+    console.error('Failed to start MFT Indexer MCP server:', error);
+    process.exit(1);
+  });
 }

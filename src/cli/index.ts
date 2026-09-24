@@ -1,8 +1,9 @@
+#!/usr/bin/env node
 // CLI Entry Point
 import { Command } from 'commander';
-import { MFTIndexer, createIndexer } from '../mft';
-import { DiskReporter, createDiskReporter } from '../reporter';
-import { MFTMCPServer, createMCPServer } from '../mcp';
+import { createIndexer } from '../mft/indexer';
+import { createDiskReporter } from '../reporter';
+import { createMCPServer } from '../mcp';
 import chalk from 'chalk';
 import ora from 'ora';
 
@@ -17,17 +18,17 @@ program
   .command('index')
   .description('Index a drive using MFT')
   .argument('<driveLetter>', 'Drive letter (e.g., C)')
-  .option('-h, --hidden', 'Include hidden files', false)
+  .option('-H, --hidden', 'Include hidden files', false)
   .option('-s, --system', 'Include system files', false)
   .option('-b, --batch-size <number>', 'Batch size for indexing', '1000')
   .action(async (driveLetter, options) => {
     const spinner = ora(`Indexing ${driveLetter}:...`).start();
     
     try {
-      const indexer = createIndexer(driveLetter.toUpperCase(), {
+      const indexer = createIndexer(driveLetter, {
         includeHidden: options.hidden,
         includeSystem: options.system,
-        batchSize: parseInt(options.batchSize),
+        batchSize: parseInt(options.batchSize, 10),
       });
       
       indexer.on('progress', (stats) => {
@@ -46,7 +47,7 @@ program
       
       indexer.close();
     } catch (error) {
-      spinner.fail(chalk.red(`Indexing failed: ${error}`));
+      spinner.fail(chalk.red(`Indexing failed: ${error instanceof Error ? error.message : error}`));
       process.exit(1);
     }
   });
@@ -58,14 +59,20 @@ program
   .argument('<query>', 'Search query')
   .option('-l, --limit <number>', 'Limit results', '100')
   .action(async (driveLetter, query, options) => {
-    const indexer = createIndexer(driveLetter.toUpperCase());
-    const results = indexer.search(query, parseInt(options.limit));
-    
-    console.log(chalk.cyan(`\nFound ${results.length} files matching "${query}":\n`));
-    for (const file of results) {
-      console.log(`  ${file.fileName} ${chalk.gray(`(${formatBytes(file.realSize)})`)} ${chalk.gray(`- ${file.modificationTime.toISOString()}`)}`);
+    const indexer = createIndexer(driveLetter);
+    if (!indexer.hasIndex()) {
+      console.error(chalk.red(`Drive ${driveLetter.toUpperCase()} is not indexed yet. Run: mft-indexer index ${driveLetter} (as Administrator)`));
+      indexer.close();
+      process.exit(1);
     }
-    
+    const results = indexer.search(query, parseInt(options.limit, 10));
+
+    console.log(chalk.cyan(`\nFound ${results.length} entries matching "${query}":\n`));
+    for (const file of results) {
+      const isDir = (file.flags & 0x02) !== 0;
+      console.log(`  ${file.fullPath} ${isDir ? chalk.gray('[dir]') : chalk.gray(`(${formatBytes(file.realSize)})`)} ${chalk.gray(`- ${file.modificationTime.toISOString()}`)}`);
+    }
+
     indexer.close();
   });
 
@@ -76,24 +83,29 @@ program
   .option('-t, --type <type>', 'Type: files or dirs', 'files')
   .option('-l, --limit <number>', 'Limit results', '50')
   .action(async (driveLetter, options) => {
-    const indexer = createIndexer(driveLetter.toUpperCase());
-    
+    const indexer = createIndexer(driveLetter);
+    if (!indexer.hasIndex()) {
+      console.error(chalk.red(`Drive ${driveLetter.toUpperCase()} is not indexed yet. Run: mft-indexer index ${driveLetter} (as Administrator)`));
+      indexer.close();
+      process.exit(1);
+    }
+
     if (options.type === 'files') {
-      const results = indexer.getLargestFiles(parseInt(options.limit));
-      console.log(chalk.cyan(`\nTop ${results.length} largest files on ${driveLetter}:\n`));
+      const results = indexer.getLargestFiles(parseInt(options.limit, 10));
+      console.log(chalk.cyan(`\nTop ${results.length} largest files on ${driveLetter.toUpperCase()}:\n`));
       for (let i = 0; i < results.length; i++) {
         const file = results[i];
-        console.log(`  ${chalk.yellow(`${i + 1}.`)} ${file.fileName} ${chalk.gray(`(${formatBytes(file.realSize)})`)}`);
+        console.log(`  ${chalk.yellow(`${i + 1}.`)} ${file.fullPath} ${chalk.gray(`(${formatBytes(file.realSize)})`)}`);
       }
     } else {
-      const results = indexer.getLargestDirectories(parseInt(options.limit));
-      console.log(chalk.cyan(`\nTop ${results.length} largest directories on ${driveLetter}:\n`));
+      const results = indexer.getLargestDirectories(parseInt(options.limit, 10));
+      console.log(chalk.cyan(`\nTop ${results.length} largest directories on ${driveLetter.toUpperCase()}:\n`));
       for (let i = 0; i < results.length; i++) {
         const dir = results[i];
-        console.log(`  ${chalk.yellow(`${i + 1}.`)} Record ${dir.record_number} ${chalk.gray(`(${formatBytes(BigInt(dir.total_size))} - ${dir.file_count} files)`)}`);
+        console.log(`  ${chalk.yellow(`${i + 1}.`)} ${dir.path} ${chalk.gray(`(${formatBytes(dir.size)} - ${dir.fileCount.toLocaleString()} files)`)}`);
       }
     }
-    
+
     indexer.close();
   });
 
@@ -137,4 +149,9 @@ function formatBytes(bytes: bigint): string {
   return `${(num / (1024 * 1024 * 1024 * 1024)).toFixed(1)} TB`;
 }
 
-program.parse();
+if (require.main === module) {
+  program.parseAsync().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
+  });
+}

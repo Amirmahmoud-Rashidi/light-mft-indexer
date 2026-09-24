@@ -1,11 +1,10 @@
 // Disk Reporter - Fast disk usage and memory reporting
 import { Win32API } from '../mft/win32';
-import { DiskUsage, FileInfo, DirectoryInfo, DriveInfo } from '../mft/types';
+import { normalizeDriveLetter } from '../mft/drive';
+import { DiskUsage, DriveInfo } from '../mft/types';
 import * as os from 'os';
 
 export class DiskReporter {
-  private driveCache: Map<string, DriveInfo> = new Map();
-  private cacheTimeout = 30000; // 30 seconds
 
   getDrives(): DriveInfo[] {
     const drives: DriveInfo[] = [];
@@ -47,20 +46,22 @@ export class DiskReporter {
   }
 
   getDiskUsage(driveLetter: string): DiskUsage {
-    const drive = `${driveLetter.toUpperCase()}:`;
+    const letter = normalizeDriveLetter(driveLetter);
+    const drive = `${letter}:`;
     const space = Win32API.getDiskFreeSpace(drive);
     
     const totalSpace = space.totalBytes;
-    const freeSpace = space.freeBytes;
+    const freeSpace = space.totalFreeBytes;
     const usedSpace = totalSpace - freeSpace;
     const usagePercent = totalSpace > 0n ? Number(usedSpace * 100n / totalSpace) : 0;
     
-    // Get file counts from MFT indexer if available, otherwise estimate
+    // File counts and largest files/directories come from the index (see the MCP server); this
+    // reporter only knows what Windows reports about the volume itself.
     const fileCount = 0;
     const directoryCount = 0;
     
     return {
-      driveLetter: driveLetter.toUpperCase(),
+      driveLetter: letter,
       totalSpace,
       freeSpace,
       usedSpace,

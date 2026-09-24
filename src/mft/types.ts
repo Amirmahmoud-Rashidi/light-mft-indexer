@@ -7,16 +7,33 @@ export interface MFTRecord {
   flags: MFTRecordFlags;
   linkCount: number;
   attributeOffset: number;
-  attributes: MFTAttribute[];
+  /** Raw attribute list. Not populated by the parser (kept empty to save memory). */
+  attributes?: MFTAttribute[];
   fileName: string;
+  /** Full path (e.g. C:\\Users\\me\\a.txt). Only set for records loaded from the index database. */
+  fullPath?: string;
   parentRecordNumber: number;
   creationTime: Date;
   modificationTime: Date;
   accessTime: Date;
   mftModificationTime: Date;
-  allocatedSize: number;
-  realSize: number;
+  allocatedSize: bigint;
+  realSize: bigint;
   fileAttributes: FileAttributes;
+}
+
+/** Result of parsing one raw MFT record (adds the fields the indexer needs). */
+export interface ParsedRecord extends MFTRecord {
+  /** 0 for a base record; otherwise the record number of the base record this extension belongs to. */
+  baseRecordNumber: number;
+  /** True if the record contains an unnamed $DATA attribute that carries size information (first extent). */
+  hasSizedData: boolean;
+  /** True if the record has an $ATTRIBUTE_LIST (some attributes live in extension records). */
+  hasAttributeList: boolean;
+  /** Data runs of the unnamed $DATA attribute (only when requested, e.g. for the $MFT record itself). */
+  dataRuns?: DataRun[];
+  /** Last VCN of the unnamed non-resident $DATA attribute in this record (only when data runs were requested). */
+  dataLastVcn?: bigint;
 }
 
 export enum MFTRecordFlags {
@@ -95,10 +112,46 @@ export interface AttributeContent {
   dataRuns?: DataRun[];
 }
 
+/** A contiguous extent of a non-resident attribute. Both fields are in BYTES. */
 export interface DataRun {
+  /** Length of the run in bytes. */
   length: bigint;
+  /** Absolute byte offset on the volume (LCN * bytesPerCluster). Meaningless when isSparse. */
   offset: bigint;
   isSparse: boolean;
+}
+
+/** Decoded FSCTL_GET_NTFS_VOLUME_DATA result. */
+export interface NtfsVolumeData {
+  volumeSerialNumber: bigint;
+  numberSectors: bigint;
+  totalClusters: bigint;
+  freeClusters: bigint;
+  totalReserved: bigint;
+  bytesPerSector: number;
+  bytesPerCluster: number;
+  bytesPerFileRecordSegment: number;
+  clustersPerFileRecordSegment: number;
+  mftValidDataLength: bigint;
+  mftStartLcn: bigint;
+  mft2StartLcn: bigint;
+  mftZoneStart: bigint;
+  mftZoneEnd: bigint;
+}
+
+/** Anything that can read raw bytes from a volume (real volume handle, or an in-memory image in tests). */
+export interface VolumeReader {
+  /** Read exactly `length` bytes starting at absolute byte `offset`. Alignment is handled internally. */
+  read(offset: bigint, length: number): Buffer;
+  close(): void;
+}
+
+export interface DriveInfo {
+  letter: string;
+  type: string;
+  totalSpace: bigint;
+  freeSpace: bigint;
+  usedSpace: bigint;
 }
 
 export interface StandardInformation {
@@ -157,7 +210,7 @@ export interface BootSector {
 }
 
 export interface IndexOptions {
-  driveLetter: string;
+  driveLetter?: string;
   includeHidden?: boolean;
   includeSystem?: boolean;
   maxDepth?: number;
@@ -217,8 +270,18 @@ export interface SearchFilters {
   attributes?: FileAttributes[];
 }
 
-export interface SearchResult {
+export interface FileSearchResult {
   files: MFTRecord[];
   totalMatches: number;
   searchTime: number;
+}
+
+/** One row of the "largest directories" report. */
+export interface LargestDirectory {
+  recordNumber: number;
+  path: string;
+  /** Total size of all files below this directory (recursive), in bytes. */
+  size: bigint;
+  /** Number of files below this directory (recursive). */
+  fileCount: number;
 }

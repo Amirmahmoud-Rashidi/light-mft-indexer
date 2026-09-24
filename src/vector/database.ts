@@ -1,4 +1,8 @@
 // Vector Database - For semantic file search using embeddings
+//
+// NOTE: the "embeddings" below are pseudo-random vectors derived from a hash of the text. Similar
+// names do NOT get similar vectors, so search() is not semantic. The module is kept for reference
+// but is intentionally not exposed through the MCP server.
 import Database from 'better-sqlite3';
 import * as path from 'path';
 import { EventEmitter } from 'events';
@@ -17,7 +21,7 @@ export interface FileEmbedding {
   metadata: Record<string, any>;
 }
 
-export interface SearchResult {
+export interface VectorSearchResult {
   recordNumber: number;
   fileName: string;
   fullPath: string;
@@ -151,7 +155,7 @@ export class VectorDatabase extends EventEmitter {
     this.emit('batchAdded', { count: files.length });
   }
 
-  async search(query: string, limit: number = 10, threshold: number = 0.3): Promise<SearchResult[]> {
+  async search(query: string, limit: number = 10, threshold: number = 0.3): Promise<VectorSearchResult[]> {
     const queryEmbedding = this.generateEmbedding(query.toLowerCase());
     
     const stmt = this.db.prepare(`
@@ -160,10 +164,10 @@ export class VectorDatabase extends EventEmitter {
     `);
     
     const rows = stmt.all() as any[];
-    const results: SearchResult[] = [];
+    const results: VectorSearchResult[] = [];
     
     for (const row of rows) {
-      const embedding = new Float32Array(row.embedding.buffer);
+      const embedding = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, this.dimensions);
       const score = this.cosineSimilarity(queryEmbedding, embedding);
       
       if (score >= threshold) {
@@ -183,7 +187,7 @@ export class VectorDatabase extends EventEmitter {
     return results.slice(0, limit);
   }
 
-  async searchByPath(pathPrefix: string, limit: number = 10): Promise<SearchResult[]> {
+  async searchByPath(pathPrefix: string, limit: number = 10): Promise<VectorSearchResult[]> {
     const stmt = this.db.prepare(`
       SELECT record_number, file_name, full_path, embedding, metadata
       FROM embeddings
@@ -217,7 +221,7 @@ export class VectorDatabase extends EventEmitter {
       recordNumber: row.record_number,
       fileName: row.file_name,
       fullPath: row.full_path,
-      embedding: new Float32Array(row.embedding.buffer),
+      embedding: new Float32Array(row.embedding.buffer, row.embedding.byteOffset, this.dimensions),
       metadata: JSON.parse(row.metadata || '{}'),
     };
   }
