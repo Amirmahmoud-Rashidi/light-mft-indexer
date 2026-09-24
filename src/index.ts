@@ -1,6 +1,5 @@
-// MFT Module - Main exports
-export * from './types';
-export * from './drive';
-export * from './win32';
-export * from './parser';
-export * from './indexer';
+// Main entry point (library API). The CLI lives in ./cli and is started via `mft-indexer` / dist/cli/index.js.
+export * from './mft';
+export * from './vector';
+export * from './mcp';
+export * from './reporter';
