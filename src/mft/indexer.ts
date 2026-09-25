@@ -2,18 +2,24 @@
 import Database from 'better-sqlite3';
 import { EventEmitter } from 'events';
 import { getIndexDbPath, normalizeDriveLetter } from './drive';
+import { extensionOf, resolveTypes } from './file-types';
 import { createMFTParser } from './parser';
 import {
+  EntryFilter,
   FileAttributes,
+  FindCriteria,
   IndexOptions,
   IndexStats,
   LargestDirectory,
   MFTRecord,
   MFTRecordFlags,
+  PAGE_SIZE,
+  Page,
   ParsedRecord,
+  SortOrder,
 } from './types';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const ROOT_RECORD = 5;
 const YIELD_EVERY = 20000; // records between event-loop yields while scanning
 const MAX_DEPTH = 4096; // guard against cyclic parent chains in a corrupt MFT
@@ -29,13 +35,32 @@ export interface IndexerDeps {
   dbPath?: string;
 }
 
+/**
+ * Sizes are tracked per attribute "class" so that recursive directory sizes can be answered exactly for every
+ * hidden/system filter combination: class = (Hidden ? 1 : 0) | (System ? 2 : 0).
+ */
+type ByClass = [number, number, number, number];
+const zero = (): ByClass => [0, 0, 0, 0];
+const attrClass = (attrs: number): number =>
+  ((attrs & FileAttributes.HIDDEN) !== 0 ? 1 : 0) | ((attrs & FileAttributes.SYSTEM) !== 0 ? 2 : 0);
+
 interface DirAcc {
   parent?: number;
   name?: string;
-  size: number; // bytes of files directly inside
-  files: number; // files directly inside
-  treeSize: number;
-  treeFiles: number;
+  size: ByClass; // bytes of files directly inside
+  files: ByClass; // files directly inside
+  treeSize: ByClass;
+  treeFiles: ByClass;
+}
+
+/** Validate a 1-based page number coming from a CLI/MCP client (numbers or numeric strings). */
+export function parsePage(value: unknown): number {
+  if (value === undefined || value === null || value === '') return 1;
+  const n = typeof value === 'string' ? Number(value) : (value as number);
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) {
+    throw new Error(`Invalid page "${String(value)}": page must be an integer >= 1 (each page holds ${PAGE_SIZE} entries).`);
+  }
+  return n;
 }
 
 /** Escape LIKE wildcards; '^' is the escape character because '\' appears in Windows paths. */
@@ -91,8 +116,14 @@ export class MFTIndexer extends EventEmitter {
         mft_modification_time INTEGER,
         allocated_size INTEGER NOT NULL DEFAULT 0,
         real_size INTEGER NOT NULL DEFAULT 0,
+        ext TEXT NOT NULL DEFAULT '',           -- lower-case extension without dot (files only)
         tree_size INTEGER NOT NULL DEFAULT 0,   -- directories: recursive size of all files below
         tree_files INTEGER NOT NULL DEFAULT 0,  -- directories: recursive file count
+        -- directories: the same, split by attribute class (0 plain, 1 hidden, 2 system, 3 hidden+system)
+        tree_size_c0 INTEGER NOT NULL DEFAULT 0, tree_size_c1 INTEGER NOT NULL DEFAULT 0,
+        tree_size_c2 INTEGER NOT NULL DEFAULT 0, tree_size_c3 INTEGER NOT NULL DEFAULT 0,
+        tree_files_c0 INTEGER NOT NULL DEFAULT 0, tree_files_c1 INTEGER NOT NULL DEFAULT 0,
+        tree_files_c2 INTEGER NOT NULL DEFAULT 0, tree_files_c3 INTEGER NOT NULL DEFAULT 0,
         file_attributes INTEGER,
         flags INTEGER,
         is_directory INTEGER NOT NULL
@@ -117,6 +148,7 @@ export class MFTIndexer extends EventEmitter {
       CREATE INDEX IF NOT EXISTS idx_size ON files(real_size);
       CREATE INDEX IF NOT EXISTS idx_modified ON files(modification_time);
       CREATE INDEX IF NOT EXISTS idx_dir_tree ON files(is_directory, tree_size);
+      CREATE INDEX IF NOT EXISTS idx_ext ON files(ext, real_size);
     `);
   }
 
@@ -127,6 +159,7 @@ export class MFTIndexer extends EventEmitter {
       DROP INDEX IF EXISTS idx_size;
       DROP INDEX IF EXISTS idx_modified;
       DROP INDEX IF EXISTS idx_dir_tree;
+      DROP INDEX IF EXISTS idx_ext;
     `);
   }
 
@@ -149,18 +182,19 @@ export class MFTIndexer extends EventEmitter {
 
       const insert = this.db.prepare(`
         INSERT OR REPLACE INTO files
-        (record_number, sequence_number, parent_record_number, file_name,
+        (record_number, sequence_number, parent_record_number, file_name, ext,
          creation_time, modification_time, access_time, mft_modification_time,
          allocated_size, real_size, file_attributes, flags, is_directory)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       const insertBatch = this.db.transaction((batch: ParsedRecord[]) => {
         for (const r of batch) {
+          const isDir = (r.flags & MFTRecordFlags.DIRECTORY) !== 0;
           insert.run(
-            r.recordNumber, r.sequenceNumber, r.parentRecordNumber, r.fileName,
+            r.recordNumber, r.sequenceNumber, r.parentRecordNumber, r.fileName, isDir ? '' : extensionOf(r.fileName),
             r.creationTime.getTime(), r.modificationTime.getTime(),
             r.accessTime.getTime(), r.mftModificationTime.getTime(),
             Number(r.allocatedSize), Number(r.realSize),
-            r.fileAttributes, r.flags, (r.flags & MFTRecordFlags.DIRECTORY) !== 0 ? 1 : 0
+            r.fileAttributes, r.flags, isDir ? 1 : 0
           );
         }
       });
@@ -168,7 +202,7 @@ export class MFTIndexer extends EventEmitter {
       const dirs = new Map<number, DirAcc>();
       const acc = (id: number): DirAcc => {
         let a = dirs.get(id);
-        if (!a) dirs.set(id, (a = { size: 0, files: 0, treeSize: 0, treeFiles: 0 }));
+        if (!a) dirs.set(id, (a = { size: zero(), files: zero(), treeSize: zero(), treeFiles: zero() }));
         return a;
       };
       // Size info for files whose $DATA lives in an extension record (seen before or after the base record).
@@ -208,9 +242,10 @@ export class MFTIndexer extends EventEmitter {
           if (!options.includeHidden && (rec.fileAttributes & FileAttributes.HIDDEN)) continue;
           if (!options.includeSystem && (rec.fileAttributes & FileAttributes.SYSTEM)) continue;
           const size = Number(rec.realSize);
+          const cls = attrClass(rec.fileAttributes);
           const p = acc(rec.parentRecordNumber);
-          p.size += size;
-          p.files += 1;
+          p.size[cls] += size;
+          p.files[cls] += 1;
           totalFiles++;
           totalSize += size;
         }
@@ -222,17 +257,17 @@ export class MFTIndexer extends EventEmitter {
 
       // -- sizes for files whose $DATA is in an extension record ---------------------------------
       if (sizeFixes.size > 0) {
-        const getFile = this.db.prepare('SELECT parent_record_number AS parent, real_size AS size FROM files WHERE record_number = ? AND is_directory = 0');
+        const getFile = this.db.prepare('SELECT parent_record_number AS parent, real_size AS size, file_attributes AS attrs FROM files WHERE record_number = ? AND is_directory = 0');
         const setSize = this.db.prepare('UPDATE files SET real_size = ?, allocated_size = ? WHERE record_number = ?');
         this.db.transaction(() => {
           for (const [recordNumber, fix] of sizeFixes) {
-            const row = getFile.get(recordNumber) as { parent: number; size: number } | undefined;
+            const row = getFile.get(recordNumber) as { parent: number; size: number; attrs: number } | undefined;
             if (!row) continue;
             const newSize = Number(fix.real);
             const delta = newSize - row.size;
             setSize.run(newSize, Number(fix.alloc), recordNumber);
             const p = acc(row.parent);
-            p.size += delta;
+            p.size[attrClass(row.attrs)] += delta;
             totalSize += delta;
           }
         })();
@@ -265,22 +300,29 @@ export class MFTIndexer extends EventEmitter {
 
       // -- recursive directory sizes ---------------------------------------------------------------
       for (const [id, d] of dirs) {
-        if (d.files === 0 && d.size === 0) continue;
+        if (d.files.every((n) => n === 0) && d.size.every((n) => n === 0)) continue;
         let cur: number | undefined = id;
         for (let depth = 0; cur !== undefined && depth < MAX_DEPTH; depth++) {
           const a: DirAcc | undefined = dirs.get(cur);
           if (!a) break;
-          a.treeSize += d.size;
-          a.treeFiles += d.files;
+          for (let c = 0; c < 4; c++) {
+            a.treeSize[c] += d.size[c];
+            a.treeFiles[c] += d.files[c];
+          }
           cur = cur === ROOT_RECORD ? undefined : a.parent;
         }
       }
 
-      const setDir = this.db.prepare('UPDATE files SET dir_path = ?, tree_size = ?, tree_files = ? WHERE record_number = ? AND is_directory = 1');
+      const setDir = this.db.prepare(`
+        UPDATE files SET dir_path = ?, tree_size = ?, tree_files = ?,
+          tree_size_c0 = ?, tree_size_c1 = ?, tree_size_c2 = ?, tree_size_c3 = ?,
+          tree_files_c0 = ?, tree_files_c1 = ?, tree_files_c2 = ?, tree_files_c3 = ?
+        WHERE record_number = ? AND is_directory = 1`);
+      const sum = (a: ByClass) => a[0] + a[1] + a[2] + a[3];
       this.db.transaction(() => {
         for (const [id, d] of dirs) {
           if (d.name === undefined) continue; // parent referenced by a file but never seen as a directory
-          setDir.run(resolvePath(id), d.treeSize, d.treeFiles, id);
+          setDir.run(resolvePath(id), sum(d.treeSize), sum(d.treeFiles), ...d.treeSize, ...d.treeFiles, id);
         }
       })();
 
@@ -336,67 +378,141 @@ export class MFTIndexer extends EventEmitter {
     };
   }
 
+  // ---- paged queries -------------------------------------------------------------------------
+  //
+  // Nothing is ever truncated: every query returns one slice of PAGE_SIZE entries plus the total number
+  // of matches, and the caller asks for page 2, 3, ... to see the rest. Ordering is fully deterministic
+  // (ties are broken by record number) so pages never overlap or skip entries.
+  //
+  // Hidden/system filters look at the entry's OWN attributes. For directories they also change the
+  // recursive size/file count: with includeHidden=false a directory's size excludes the hidden files below it.
+
+  /** SQL conditions shared by all entry queries (hidden/system + file types). */
+  private entryConditions(f: EntryFilter, params: unknown[]): string[] {
+    const where: string[] = [];
+    if (f.includeHidden === false) where.push(`(file_attributes & ${FileAttributes.HIDDEN}) = 0`);
+    if (f.includeSystem === false) where.push(`(file_attributes & ${FileAttributes.SYSTEM}) = 0`);
+
+    const { extensions, includeFolders } = resolveTypes(f.types);
+    if (extensions.length > 0 || includeFolders) {
+      const parts: string[] = [];
+      if (extensions.length > 0) {
+        parts.push(`(is_directory = 0 AND ext IN (${extensions.map(() => '?').join(', ')}))`);
+        params.push(...extensions);
+      }
+      if (includeFolders) parts.push('is_directory = 1');
+      where.push(parts.length > 1 ? `(${parts.join(' OR ')})` : parts[0]);
+    }
+    return where;
+  }
+
+  private makePage<T>(items: T[], total: number, page: number): Page<T> {
+    const offset = (page - 1) * PAGE_SIZE;
+    return {
+      items,
+      total,
+      page,
+      pageSize: PAGE_SIZE,
+      totalPages: Math.ceil(total / PAGE_SIZE),
+      offset,
+      hasMore: offset + items.length < total,
+    };
+  }
+
+  /** The general query behind search / size / date / largest-files. */
+  find(criteria: FindCriteria, sort: SortOrder = 'relevance'): Page<MFTRecord> {
+    const page = parsePage(criteria.page);
+    const params: unknown[] = [];
+    const conditions = this.entryConditions(criteria, params);
+
+    const hasSize = criteria.minSize !== undefined || criteria.maxSize !== undefined;
+    if (criteria.filesOnly || hasSize) conditions.push('is_directory = 0');
+    if (criteria.minSize !== undefined) { conditions.push('real_size >= ?'); params.push(Number(criteria.minSize)); }
+    if (criteria.maxSize !== undefined) { conditions.push('real_size <= ?'); params.push(Number(criteria.maxSize)); }
+    if (criteria.after !== undefined) { conditions.push('modification_time >= ?'); params.push(criteria.after.getTime()); }
+    if (criteria.before !== undefined) { conditions.push('modification_time <= ?'); params.push(criteria.before.getTime()); }
+
+    let usesPath = false;
+    const orderParams: unknown[] = [];
+    let order = 'real_size DESC, record_number';
+    const query = criteria.query;
+    if (query !== undefined && query !== '') {
+      usesPath = /[\\/]/.test(query);
+      const q = usesPath ? query.replace(/\//g, '\\') : query;
+      conditions.push(`${usesPath ? 'full_path' : 'file_name'} LIKE ? ESCAPE '^'`);
+      params.push(`%${escapeLike(q)}%`);
+      if (sort === 'relevance') {
+        order = '(file_name = ? COLLATE NOCASE) DESC, real_size DESC, record_number';
+        orderParams.push(q);
+      }
+    }
+    if (sort === 'size') order = 'real_size DESC, record_number';
+    if (sort === 'date') order = 'modification_time DESC, record_number';
+
+    const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    // Counting only needs the (cheaper) table unless the path column is involved.
+    const total = (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM ${usesPath ? 'file_paths' : 'files'} ${whereSql}`)
+      .get(...params) as { n: number }).n;
+    const rows = this.db
+      .prepare(`SELECT * FROM file_paths ${whereSql} ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .all(...params, ...orderParams, PAGE_SIZE, (page - 1) * PAGE_SIZE) as any[];
+    return this.makePage(rows.map((row) => this.rowToRecord(row)), total, page);
+  }
+
   /**
    * Search by name (substring, case-insensitive). If the query contains a path separator it is
-   * matched against the full path instead.
+   * matched against the full path instead. Exact name matches come first.
    */
-  search(query: string, limit: number = 100): MFTRecord[] {
-    const byPath = /[\\/]/.test(query);
-    const q = byPath ? query.replace(/\//g, '\\') : query;
-    const column = byPath ? 'full_path' : 'file_name';
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM file_paths
-         WHERE ${column} LIKE ? ESCAPE '^'
-         ORDER BY (file_name = ? COLLATE NOCASE) DESC, real_size DESC
-         LIMIT ?`
-      )
-      .all(`%${escapeLike(q)}%`, q, limit) as any[];
-    return rows.map((row) => this.rowToRecord(row));
+  search(query: string, filter: EntryFilter = {}): Page<MFTRecord> {
+    return this.find({ ...filter, query }, 'relevance');
   }
 
-  searchBySize(minSize: bigint, maxSize: bigint, limit: number = 100): MFTRecord[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM file_paths WHERE is_directory = 0 AND real_size >= ? AND real_size <= ?
-         ORDER BY real_size DESC LIMIT ?`
-      )
-      .all(Number(minSize), Number(maxSize), limit) as any[];
-    return rows.map((row) => this.rowToRecord(row));
+  /** Files within a size range (bytes, inclusive; either bound may be omitted). Largest first. */
+  searchBySize(minSize: bigint | undefined, maxSize: bigint | undefined, filter: EntryFilter = {}): Page<MFTRecord> {
+    return this.find({ ...filter, minSize, maxSize, filesOnly: true }, 'size');
   }
 
-  searchByDate(after: Date, before: Date, limit: number = 100): MFTRecord[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM file_paths WHERE modification_time >= ? AND modification_time <= ?
-         ORDER BY modification_time DESC LIMIT ?`
-      )
-      .all(after.getTime(), before.getTime(), limit) as any[];
-    return rows.map((row) => this.rowToRecord(row));
+  /** Entries modified within a time range (inclusive; either bound may be omitted). Newest first. */
+  searchByDate(after: Date | undefined, before: Date | undefined, filter: EntryFilter = {}): Page<MFTRecord> {
+    return this.find({ ...filter, after, before }, 'date');
   }
 
-  getLargestFiles(limit: number = 50): MFTRecord[] {
-    const rows = this.db
-      .prepare('SELECT * FROM file_paths WHERE is_directory = 0 ORDER BY real_size DESC LIMIT ?')
-      .all(limit) as any[];
-    return rows.map((row) => this.rowToRecord(row));
+  getLargestFiles(filter: EntryFilter = {}): Page<MFTRecord> {
+    return this.find({ ...filter, filesOnly: true }, 'size');
   }
 
-  /** Largest directories by recursive size (the drive root itself is excluded). */
-  getLargestDirectories(limit: number = 50): LargestDirectory[] {
+  /**
+   * Largest directories by recursive size, biggest first (the drive root itself and directories that
+   * contain no files are excluded). `types` is ignored here.
+   */
+  getLargestDirectories(filter: EntryFilter = {}): Page<LargestDirectory> {
+    const page = parsePage(filter.page);
+    // Which attribute classes count towards a directory's size for this filter (see ByClass).
+    const classes = [0];
+    if (filter.includeHidden !== false) classes.push(1);
+    if (filter.includeSystem !== false) classes.push(2);
+    if (filter.includeHidden !== false && filter.includeSystem !== false) classes.push(3);
+    const sizeExpr = classes.length === 4 ? 'tree_size' : classes.map((c) => `tree_size_c${c}`).join(' + ');
+    const filesExpr = classes.length === 4 ? 'tree_files' : classes.map((c) => `tree_files_c${c}`).join(' + ');
+
+    const conditions = ['is_directory = 1', 'record_number != ?', 'dir_path IS NOT NULL', `(${filesExpr}) > 0`];
+    if (filter.includeHidden === false) conditions.push(`(file_attributes & ${FileAttributes.HIDDEN}) = 0`);
+    if (filter.includeSystem === false) conditions.push(`(file_attributes & ${FileAttributes.SYSTEM}) = 0`);
+    const whereSql = `WHERE ${conditions.join(' AND ')}`;
+
+    const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM files ${whereSql}`).get(ROOT_RECORD) as { n: number }).n;
     const rows = this.db
       .prepare(
-        `SELECT record_number, dir_path, tree_size, tree_files FROM files
-         WHERE is_directory = 1 AND record_number != ? AND dir_path IS NOT NULL
-         ORDER BY tree_size DESC LIMIT ?`
+        `SELECT record_number, dir_path, (${sizeExpr}) AS size, (${filesExpr}) AS file_count FROM files ${whereSql}
+         ORDER BY (${sizeExpr}) DESC, record_number LIMIT ? OFFSET ?`
       )
-      .all(ROOT_RECORD, limit) as any[];
-    return rows.map((r) => ({
-      recordNumber: r.record_number,
-      path: r.dir_path,
-      size: BigInt(r.tree_size),
-      fileCount: r.tree_files,
-    }));
+      .all(ROOT_RECORD, PAGE_SIZE, (page - 1) * PAGE_SIZE) as any[];
+    return this.makePage(
+      rows.map((r) => ({ recordNumber: r.record_number, path: r.dir_path, size: BigInt(r.size), fileCount: r.file_count })),
+      total,
+      page
+    );
   }
 
   getDatabasePath(): string {

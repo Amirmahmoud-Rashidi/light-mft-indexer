@@ -287,3 +287,50 @@ export interface LargestDirectory {
   /** Number of files below this directory (recursive). */
   fileCount: number;
 }
+
+/** Number of entries in one result slice (page). Results are never truncated: ask for the next page. */
+export const PAGE_SIZE = 50;
+
+/** One slice of a (possibly very large) result set. */
+export interface Page<T> {
+  items: T[];
+  /** Total number of matching entries across ALL pages. */
+  total: number;
+  /** 1-based page number of `items`. */
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  /** 0-based index of the first item of this page within the whole result set. */
+  offset: number;
+  hasMore: boolean;
+}
+
+/** Filters shared by every query. */
+export interface EntryFilter {
+  /** Include entries with the Hidden attribute (default true). */
+  includeHidden?: boolean;
+  /** Include entries with the System attribute (default true). */
+  includeSystem?: boolean;
+  /**
+   * File types: category names (image, video, audio, document, ebook, archive, disk_image, executable, code,
+   * database, font), "folder", and/or extensions such as "mkv" or ".mkv". Empty/undefined = any type.
+   */
+  types?: string[];
+  /** 1-based page number (default 1). */
+  page?: number;
+}
+
+export interface FindCriteria extends EntryFilter {
+  /** Name substring (case-insensitive). If it contains "\\" or "/" it is matched against the full path. */
+  query?: string;
+  /** Size range in bytes (inclusive). Using either restricts the result to files. */
+  minSize?: bigint;
+  maxSize?: bigint;
+  /** Modification time range (inclusive). */
+  after?: Date;
+  before?: Date;
+  /** Restrict to files (exclude directories). */
+  filesOnly?: boolean;
+}
+
+export type SortOrder = 'relevance' | 'size' | 'date';

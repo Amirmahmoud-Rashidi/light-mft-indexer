@@ -6,9 +6,9 @@ file search / disk-usage tools to AI assistants through an MCP server.
 ## Features
 
 - **MFT-based indexing**: reads `$MFT` in large sequential chunks (follows its data runs, applies NTFS fixups)
-- **Instant search** by name, path, size or modification date over a local SQLite index
+- **Instant search** by name, path, file type, size, modification date, hidden/system over a local SQLite index; results are paged (50 per page), never truncated
 - **Recursive directory sizes** ("what is eating my disk?")
-- **MCP server** (stdio) with 9 tools, **CLI** for the same operations
+- **MCP server** (stdio) with 10 tools, **CLI** for the same operations
 - **No compiler needed**: native access uses [koffi](https://koffi.dev) (prebuilt binaries). No Visual Studio, no node-gyp.
 
 ## Requirements
@@ -56,11 +56,47 @@ search tools work from the index and return a clear error if the drive has not b
 
 | Tool | Purpose |
 |------|---------|
-| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator). Hidden and system files (`hiberfil.sys`, `pagefile.sys`, `$MFT`, ...) are included by default; pass `includeHidden: false` / `includeSystem: false` to skip them (CLI: `--no-hidden`, `--no-system`) |
-| `search_files` | Name search (case-insensitive substring). A query containing `\` or `/` is matched against the full path |
-| `search_by_size` / `search_by_date` | Range searches |
-| `get_largest_files` / `get_largest_directories` | Top-N by size (directories are recursive) |
+| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator). Leave `includeHidden`/`includeSystem` at their default (`true`): hidden and system files (`hiberfil.sys`, `pagefile.sys`, `$MFT`, ...) are filtered at search time, not at index time |
+| `search_files` | General search: name/path text and any combination of type, size range, date range, hidden/system |
+| `search_by_size` | Files in a size range (either bound optional), largest first |
+| `search_by_date` | Entries modified in a date range (either bound optional), newest first |
+| `get_largest_files` / `get_largest_directories` | All files / directories ordered by size (directory sizes are recursive) |
+| `list_file_types` | Show the preset file-type categories and their extensions |
 | `get_disk_usage` / `get_index_stats` / `list_drives` | Volume and index information |
+
+### Paging: no result limit, 50 entries per page
+
+There is no `limit` parameter and results are never cut off. Every list tool returns one page of **50 entries**,
+the **total** number of matches and whether more exist, e.g.:
+
+```
+Found 1,234 entries. Showing 1-50 (page 1 of 25).
+...
+More results: call search_files again with page=2 (1,184 more).
+```
+
+Pass `page` (1-based) to get the next slice. Ordering is deterministic, so pages never overlap or skip entries.
+
+### Filters shared by all list tools
+
+| Parameter | Meaning |
+|-----------|---------|
+| `types` | Only these file types (OR-combined). Presets: `image`, `video`, `audio`, `document`, `ebook`, `archive`, `disk_image`, `executable`, `code`, `database`, `font`; `folder` = directories. Any other format: give its extension (`"mkv"`, `".psd"`, `"*.xyz"`). Aliases such as `videos`, `pictures`, `docs`, `music` work too. Example: `["video", "iso", ".xyz"]` |
+| `includeHidden` | Include entries with the Hidden attribute (default `true`) |
+| `includeSystem` | Include entries with the System attribute, e.g. `hiberfil.sys` (default `true`) |
+| `page` | Page number, default 1 |
+
+`search_files` additionally takes `query`, `minSize`/`maxSize` (bytes or with a unit: `"500MB"`, `"1.5GB"`) and
+`after`/`before` (ISO 8601; a bare `before` date means the end of that day, UTC). The hidden/system filters look at
+an entry's own attributes; for `get_largest_directories` they also change the recursive sizes (with
+`includeSystem: false` a directory's size no longer counts the system files inside it).
+
+Examples an AI can issue: *all videos over 1 GB* (`types: ["video"], minSize: "1GB"`), *everything modified in
+January without hidden files* (`after: "2025-01-01", before: "2025-01-31", includeHidden: false`), *the next page*
+(`page: 2`).
+
+CLI equivalents: `search <drive> [query] -f video,.xyz --min-size 1GB --after 2025-01-01 --no-hidden --no-system -p 2`
+and `largest <drive> -t files|dirs -f iso --no-system -p 2`.
 
 ## Architecture
 
@@ -71,6 +107,8 @@ src/
 │   ├── parser.ts    # pure MFT record parsing (fixups, attributes, data runs) + MFTParser ($MFT scan)
 │   ├── indexer.ts   # single-pass scan -> SQLite, directory paths, recursive sizes, queries
 │   ├── drive.ts     # drive-letter validation, data directory
+│   ├── file-types.ts # preset file-type categories + custom extensions
+│   ├── args.ts      # argument parsing shared by MCP and CLI (sizes with units, dates, types, page)
 │   └── types.ts
 ├── mcp/server.ts    # MCP server
 ├── cli/index.ts     # CLI

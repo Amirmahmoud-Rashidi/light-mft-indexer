@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // CLI Entry Point
 import { Command } from 'commander';
-import { createIndexer } from '../mft/indexer';
+import { parseDate, parseFilter, parseSize } from '../mft/args';
+import { createIndexer, MFTIndexer } from '../mft/indexer';
+import { EntryFilter, Page } from '../mft/types';
 import { createDiskReporter } from '../reporter';
 import { createMCPServer } from '../mcp';
 import chalk from 'chalk';
@@ -52,61 +54,103 @@ program
     }
   });
 
+/** Open the index of a drive, or explain how to create it. */
+function openIndexed(driveLetter: string): MFTIndexer {
+  const indexer = createIndexer(driveLetter);
+  if (!indexer.hasIndex()) {
+    console.error(chalk.red(`Drive ${driveLetter.toUpperCase()} is not indexed yet. Run: mft-indexer index ${driveLetter} (as Administrator)`));
+    indexer.close();
+    process.exit(1);
+  }
+  return indexer;
+}
+
+/** Filter options shared by `search` and `largest`. Commander turns --no-hidden into hidden=false. */
+function filterFromOptions(options: any): EntryFilter {
+  return parseFilter({
+    types: options.fileTypes,
+    includeHidden: options.hidden === false ? false : undefined,
+    includeSystem: options.system === false ? false : undefined,
+    page: options.page,
+  });
+}
+
+function printPage<T>(what: string, page: Page<T>, line: (item: T) => string): void {
+  if (page.total === 0) {
+    console.log(chalk.yellow(`\nNo ${what} found.`));
+    return;
+  }
+  if (page.items.length === 0) {
+    console.log(chalk.yellow(`\nPage ${page.page} is past the end (${page.totalPages} page(s), ${page.total.toLocaleString()} ${what}).`));
+    return;
+  }
+  const first = page.offset + 1;
+  const last = page.offset + page.items.length;
+  const noun = page.total === 1 ? ({ entries: 'entry', files: 'file', directories: 'directory' } as Record<string, string>)[what] ?? what : what;
+  console.log(chalk.cyan(`\nFound ${page.total.toLocaleString()} ${noun}. Showing ${first === last ? first : `${first}-${last}`} (page ${page.page} of ${page.totalPages}):\n`));
+  page.items.forEach((item, i) => console.log(`  ${chalk.yellow(`${first + i}.`)} ${line(item)}`));
+  if (page.hasMore) console.log(chalk.gray(`\nNext page: add --page ${page.page + 1}`));
+}
+
+const attrTags = (attrs: number) => `${attrs & 0x2 ? ' [hidden]' : ''}${attrs & 0x4 ? ' [system]' : ''}`;
+
 program
   .command('search')
-  .description('Search for files')
+  .description('Search for files (paged, 50 per page). The query is optional if other filters are given')
   .argument('<driveLetter>', 'Drive letter')
-  .argument('<query>', 'Search query')
-  .option('-l, --limit <number>', 'Limit results', '100')
+  .argument('[query]', 'Name text (or path if it contains \\ or /)')
+  .option('-f, --file-types <list>', 'File types, comma separated: presets (video, image, audio, document, archive, ...), "folder", or extensions (mkv,.psd)')
+  .option('--min-size <size>', 'Minimum size in bytes or with a unit (500MB, 1.5GB)')
+  .option('--max-size <size>', 'Maximum size in bytes or with a unit')
+  .option('--after <date>', 'Modified on/after (ISO 8601)')
+  .option('--before <date>', 'Modified on/before (ISO 8601)')
+  .option('--no-hidden', 'Exclude hidden entries')
+  .option('--no-system', 'Exclude system entries')
+  .option('-p, --page <number>', 'Page number (50 entries per page)', '1')
   .action(async (driveLetter, query, options) => {
-    const indexer = createIndexer(driveLetter);
-    if (!indexer.hasIndex()) {
-      console.error(chalk.red(`Drive ${driveLetter.toUpperCase()} is not indexed yet. Run: mft-indexer index ${driveLetter} (as Administrator)`));
+    const indexer = openIndexed(driveLetter);
+    try {
+      const page = indexer.find(
+        {
+          ...filterFromOptions(options),
+          query,
+          minSize: parseSize('--min-size', options.minSize),
+          maxSize: parseSize('--max-size', options.maxSize),
+          after: parseDate('--after', options.after),
+          before: parseDate('--before', options.before, true),
+        },
+        'relevance'
+      );
+      printPage('entries', page, (file) => {
+        const isDir = (file.flags & 0x02) !== 0;
+        return `${file.fullPath} ${isDir ? chalk.gray('[dir]') : chalk.gray(`(${formatBytes(file.realSize)})`)}${chalk.gray(attrTags(file.fileAttributes))} ${chalk.gray(`- ${file.modificationTime.toISOString()}`)}`;
+      });
+    } finally {
       indexer.close();
-      process.exit(1);
     }
-    const results = indexer.search(query, parseInt(options.limit, 10));
-
-    console.log(chalk.cyan(`\nFound ${results.length} entries matching "${query}":\n`));
-    for (const file of results) {
-      const isDir = (file.flags & 0x02) !== 0;
-      console.log(`  ${file.fullPath} ${isDir ? chalk.gray('[dir]') : chalk.gray(`(${formatBytes(file.realSize)})`)} ${chalk.gray(`- ${file.modificationTime.toISOString()}`)}`);
-    }
-
-    indexer.close();
   });
 
 program
   .command('largest')
-  .description('Show largest files or directories')
+  .description('Show largest files or directories (paged, 50 per page)')
   .argument('<driveLetter>', 'Drive letter')
-  .option('-t, --type <type>', 'Type: files or dirs', 'files')
-  .option('-l, --limit <number>', 'Limit results', '50')
+  .option('-t, --type <type>', 'What to list: files or dirs', 'files')
+  .option('-f, --file-types <list>', 'Only these file types (files only), e.g. video,iso')
+  .option('--no-hidden', 'Exclude hidden entries (directory sizes then exclude hidden files too)')
+  .option('--no-system', 'Exclude system entries (directory sizes then exclude system files too)')
+  .option('-p, --page <number>', 'Page number (50 entries per page)', '1')
   .action(async (driveLetter, options) => {
-    const indexer = createIndexer(driveLetter);
-    if (!indexer.hasIndex()) {
-      console.error(chalk.red(`Drive ${driveLetter.toUpperCase()} is not indexed yet. Run: mft-indexer index ${driveLetter} (as Administrator)`));
+    const indexer = openIndexed(driveLetter);
+    try {
+      const filter = filterFromOptions(options);
+      if (options.type === 'files') {
+        printPage('files', indexer.getLargestFiles(filter), (file) => `${file.fullPath} ${chalk.gray(`(${formatBytes(file.realSize)})`)}${chalk.gray(attrTags(file.fileAttributes))}`);
+      } else {
+        printPage('directories', indexer.getLargestDirectories(filter), (dir) => `${dir.path} ${chalk.gray(`(${formatBytes(dir.size)} - ${dir.fileCount.toLocaleString()} files)`)}`);
+      }
+    } finally {
       indexer.close();
-      process.exit(1);
     }
-
-    if (options.type === 'files') {
-      const results = indexer.getLargestFiles(parseInt(options.limit, 10));
-      console.log(chalk.cyan(`\nTop ${results.length} largest files on ${driveLetter.toUpperCase()}:\n`));
-      for (let i = 0; i < results.length; i++) {
-        const file = results[i];
-        console.log(`  ${chalk.yellow(`${i + 1}.`)} ${file.fullPath} ${chalk.gray(`(${formatBytes(file.realSize)})`)}`);
-      }
-    } else {
-      const results = indexer.getLargestDirectories(parseInt(options.limit, 10));
-      console.log(chalk.cyan(`\nTop ${results.length} largest directories on ${driveLetter.toUpperCase()}:\n`));
-      for (let i = 0; i < results.length; i++) {
-        const dir = results[i];
-        console.log(`  ${chalk.yellow(`${i + 1}.`)} ${dir.path} ${chalk.gray(`(${formatBytes(dir.size)} - ${dir.fileCount.toLocaleString()} files)`)}`);
-      }
-    }
-
-    indexer.close();
   });
 
 program

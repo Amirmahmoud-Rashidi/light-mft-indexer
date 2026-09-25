@@ -24,8 +24,8 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
     const stats = await indexer.index();
     expect(stats.totalFiles).toBe(9); // + hidden.dat (hidden) and $MFT (hidden+system)
     expect(stats.totalSize).toBe(5_000_132n + 7n + 81_920n);
-    expect(paths(indexer.search('hidden.dat'))).toEqual(['C:\\Users\\hidden.dat']);
-    expect(paths(indexer.search('$MFT'))).toEqual(['C:\\$MFT']);
+    expect(paths(indexer.search('hidden.dat').items)).toEqual(['C:\\Users\\hidden.dat']);
+    expect(paths(indexer.search('$MFT').items)).toEqual(['C:\\$MFT']);
   });
 
   it('can exclude hidden and/or system files on request', async () => {
@@ -58,54 +58,54 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
   it('builds correct full paths, including out-of-order parents and orphans', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    expect(paths(indexer.search('readme'))).toEqual(['C:\\Users\\readme.txt']);
-    expect(paths(indexer.search('a.txt'))).toEqual(['C:\\Users\\Docs\\a.txt']);
-    expect(paths(indexer.search('big.bin'))).toEqual(['C:\\Users\\big.bin']);
-    expect(paths(indexer.search('inlost'))).toEqual(['C:\\<unknown>\\Lost\\inlost.txt']);
-    expect(paths(indexer.search('orphan'))).toEqual(['?\\orphan.txt']);
-    expect(paths(indexer.search('Docs'))).toEqual(['C:\\Users\\Docs']);
+    expect(paths(indexer.search('readme').items)).toEqual(['C:\\Users\\readme.txt']);
+    expect(paths(indexer.search('a.txt').items)).toEqual(['C:\\Users\\Docs\\a.txt']);
+    expect(paths(indexer.search('big.bin').items)).toEqual(['C:\\Users\\big.bin']);
+    expect(paths(indexer.search('inlost').items)).toEqual(['C:\\<unknown>\\Lost\\inlost.txt']);
+    expect(paths(indexer.search('orphan').items)).toEqual(['?\\orphan.txt']);
+    expect(paths(indexer.search('Docs').items)).toEqual(['C:\\Users\\Docs']);
   });
 
   it('uses the long name and keeps names that crossed a fixup boundary', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    expect(paths(indexer.search('long file'))).toEqual(['C:\\Users\\long file name.txt']);
-    expect(indexer.search('LONGFI~1')).toHaveLength(0); // DOS alias is not indexed
-    expect(paths(indexer.search(LONG_NAME))).toEqual([`C:\\Users\\Docs\\${LONG_NAME}.txt`]);
+    expect(paths(indexer.search('long file').items)).toEqual(['C:\\Users\\long file name.txt']);
+    expect(indexer.search('LONGFI~1').items).toHaveLength(0); // DOS alias is not indexed
+    expect(paths(indexer.search(LONG_NAME).items)).toEqual([`C:\\Users\\Docs\\${LONG_NAME}.txt`]);
   });
 
   it('skips free, torn and garbage records', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    for (const q of ['deleted', 'torn']) expect(indexer.search(q)).toHaveLength(0);
+    for (const q of ['deleted', 'torn']) expect(indexer.search(q).items).toHaveLength(0);
   });
 
   it('searches by path when the query contains a separator, case-insensitively', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    expect(paths(indexer.search('users\\docs'))).toEqual(['C:\\Users\\Docs', `C:\\Users\\Docs\\${LONG_NAME}.txt`, 'C:\\Users\\Docs\\a.txt'].sort());
-    expect(paths(indexer.search('Users/Docs/a.t'))).toEqual(['C:\\Users\\Docs\\a.txt']); // forward slashes accepted
+    expect(paths(indexer.search('users\\docs').items)).toEqual(['C:\\Users\\Docs', `C:\\Users\\Docs\\${LONG_NAME}.txt`, 'C:\\Users\\Docs\\a.txt'].sort());
+    expect(paths(indexer.search('Users/Docs/a.t').items)).toEqual(['C:\\Users\\Docs\\a.txt']); // forward slashes accepted
   });
 
   it('treats LIKE wildcards in the query literally', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    expect(indexer.search('%')).toHaveLength(0);
-    expect(indexer.search('_')).toHaveLength(0);
-    expect(indexer.search("x'; DROP TABLE files; --")).toHaveLength(0);
-    expect(indexer.search('readme')).toHaveLength(1); // table still there
+    expect(indexer.search('%').items).toHaveLength(0);
+    expect(indexer.search('_').items).toHaveLength(0);
+    expect(indexer.search("x'; DROP TABLE files; --").items).toHaveLength(0);
+    expect(indexer.search('readme').items).toHaveLength(1); // table still there
   });
 
   it('ranks an exact name match first', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    expect(indexer.search('a.txt')[0].fileName).toBe('a.txt');
+    expect(indexer.search('a.txt').items[0].fileName).toBe('a.txt');
   });
 
   it('computes recursive directory sizes', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    const dirs = indexer.getLargestDirectories(10);
+    const dirs = indexer.getLargestDirectories().items;
     expect(dirs.map((d) => d.path)).toEqual(['C:\\Users', 'C:\\Users\\Docs', 'C:\\<unknown>\\Lost']);
     expect(dirs[0].size).toBe(5_000_119n); // readme + big + Docs(a.txt + long) + DOS file
     expect(dirs[0].fileCount).toBe(5);
@@ -117,12 +117,12 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
   it('answers size/date/largest queries with bigint sizes and Date times', async () => {
     const { indexer } = makeIndexer();
     await indexer.index();
-    const largest = indexer.getLargestFiles(2);
+    const largest = indexer.getLargestFiles().items;
     expect(largest[0].fullPath).toBe('C:\\Users\\big.bin');
     expect(largest[0].realSize).toBe(5_000_000n);
     expect(largest[0].allocatedSize).toBe(5_001_216n);
-    expect(paths(indexer.searchBySize(50n, 200n))).toEqual(['C:\\Users\\Docs\\a.txt']);
-    const byDate = indexer.searchByDate(new Date('2024-02-01'), new Date('2024-02-28'));
+    expect(paths(indexer.searchBySize(50n, 200n).items)).toEqual(['C:\\Users\\Docs\\a.txt']);
+    const byDate = indexer.searchByDate(new Date('2024-02-01'), new Date('2024-02-28')).items;
     expect(byDate.length).toBeGreaterThan(0);
     expect(byDate[0].modificationTime.toISOString()).toBe('2024-02-03T04:05:06.000Z');
   });
@@ -131,7 +131,7 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
     const { indexer } = makeIndexer();
     await indexer.index();
     await indexer.index();
-    expect(indexer.search('readme')).toHaveLength(1);
+    expect(indexer.search('readme').items).toHaveLength(1);
     expect(indexer.getStats()!.totalFiles).toBe(7);
   });
 
