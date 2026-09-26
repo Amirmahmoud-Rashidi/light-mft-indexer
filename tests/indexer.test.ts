@@ -160,6 +160,27 @@ describe('MFTIndexer (synthetic volume, real SQLite)', () => {
     await first;
   });
 
+  it('never gets stuck reporting "already in progress" after ANY index() failure, including openParser() itself throwing', async () => {
+    // Regression test: openParser() throwing (e.g. "not Windows", "access denied", or - after the
+    // --only/--exclude feature - an invalid scope) must not leave isIndexing permanently true.
+    const indexer = new MFTIndexer('C', {}, {
+      openParser: () => { throw new Error('simulated: cannot open volume'); },
+      dbPath: ':memory:',
+    });
+    await expect(indexer.index()).rejects.toThrow('simulated: cannot open volume');
+    // if isIndexing were stuck, this would reject with "already in progress" instead of the real error
+    await expect(indexer.index()).rejects.toThrow('simulated: cannot open volume');
+  });
+
+  it('an invalid --only/--exclude combination is rejected before isIndexing is set, so it never blocks a later call either', async () => {
+    const fake = makeFakeVolume();
+    const indexer = new MFTIndexer('C', {}, { openParser: () => fake.parser(), dbPath: ':memory:' });
+    await expect(indexer.index({ only: ['C:\\a'], exclude: ['C:\\b'] })).rejects.toThrow(/either "only" or "exclude"/);
+    // a valid call right after must succeed, not report "already in progress"
+    const stats = await indexer.index();
+    expect(stats.totalFiles).toBeGreaterThan(0);
+  });
+
   it('validates the drive letter', () => {
     expect(() => new MFTIndexer('C:\\..\\x', {}, { dbPath: ':memory:' })).toThrow(/Invalid drive letter/);
   });

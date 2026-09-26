@@ -23,14 +23,24 @@ program
   .option('--no-hidden', 'Exclude files with the Hidden attribute')
   .option('--no-system', 'Exclude files with the System attribute (hiberfil.sys, pagefile.sys, ...)')
   .option('-b, --batch-size <number>', 'Batch size for indexing', '1000')
+  .option(
+    '--only <path-or-pattern...>',
+    'Only index these paths (with everything below them) and/or name patterns (e.g. "C:\\Projects" or "*.iso"). Cannot combine with --exclude'
+  )
+  .option(
+    '--exclude <path-or-pattern...>',
+    'Skip these paths (with everything below them) and/or name patterns (e.g. "node_modules", "*.tmp"). Cannot combine with --only'
+  )
   .action(async (driveLetter, options) => {
     const spinner = ora(`Indexing ${driveLetter}:...`).start();
-    
+
     try {
       const indexer = createIndexer(driveLetter, {
         includeHidden: options.hidden,
         includeSystem: options.system,
         batchSize: parseInt(options.batchSize, 10),
+        only: options.only,
+        exclude: options.exclude,
       });
       
       indexer.on('progress', (stats) => {
@@ -46,7 +56,10 @@ program
       console.log(`  Total Size: ${chalk.yellow(formatBytes(stats.totalSize))}`);
       console.log(`  Duration: ${chalk.yellow(`${stats.duration}ms`)}`);
       console.log(`  Indexed at: ${chalk.yellow(stats.indexedAt.toISOString())}`);
-      
+      if (stats.scope) {
+        console.log(`  Scope: ${chalk.yellow(stats.scope.mode)} ${stats.scope.entries.map((e) => `"${e}"`).join(', ')}`);
+      }
+
       indexer.close();
     } catch (error) {
       spinner.fail(chalk.red(`Indexing failed: ${error instanceof Error ? error.message : error}`));

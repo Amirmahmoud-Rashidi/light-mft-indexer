@@ -75,6 +75,18 @@ export class MFTMCPServer {
               includeHidden: { type: 'boolean', default: true, description: 'Index hidden files (default true)' },
               includeSystem: { type: 'boolean', default: true, description: 'Index system files such as hiberfil.sys and pagefile.sys (default true)' },
               batchSize: { type: 'number', default: 1000 },
+              only: {
+                type: 'array', items: { type: 'string' },
+                description:
+                  'Only index these paths (with everything below them) and/or name patterns (e.g. "C:\\Projects", "*.iso"). ' +
+                  'Use for a drive too large to fully index, or when only a few locations matter: much smaller and faster to query than a full index. ' +
+                  'Cannot be combined with exclude.',
+              },
+              exclude: {
+                type: 'array', items: { type: 'string' },
+                description:
+                  'Skip these paths (with everything below them) and/or name patterns (e.g. "node_modules", "*.tmp"). Cannot be combined with only.',
+              },
             },
             required: ['driveLetter'],
           },
@@ -325,12 +337,13 @@ export class MFTMCPServer {
   }
 
   private async handleIndexDrive(args: any) {
-    const { driveLetter, includeHidden, includeSystem, batchSize } = args;
+    const { driveLetter, includeHidden, includeSystem, batchSize, only, exclude } = args;
     const indexer = this.getOrCreateIndexer(driveLetter);
-    const stats = await indexer.index({ includeHidden, includeSystem, batchSize });
+    const stats = await indexer.index({ includeHidden, includeSystem, batchSize, only, exclude });
 
     return this.text(
       `Indexing complete for ${stats.driveLetter}:\n` +
+        (stats.scope ? `Scope: ${stats.scope.mode} ${stats.scope.entries.map((e) => `"${e}"`).join(', ')}\n` : '') +
         `Files: ${stats.totalFiles.toLocaleString()}\n` +
         `Directories: ${stats.totalDirectories.toLocaleString()}\n` +
         `Total Size: ${this.formatBytes(stats.totalSize)}\n` +
@@ -447,6 +460,10 @@ export class MFTMCPServer {
     const stats = this.getIndexedIndexer(driveLetter).getStats()!;
     return this.text(
       `Index Statistics for ${stats.driveLetter}:\n\n` +
+        (stats.scope
+          ? `Scope: ${stats.scope.mode} ${stats.scope.entries.map((e) => `"${e}"`).join(', ')} ` +
+            `(this index does not cover the whole drive)\n`
+          : '') +
         `Total Files: ${stats.totalFiles.toLocaleString()}\n` +
         `Total Directories: ${stats.totalDirectories.toLocaleString()}\n` +
         `Total Size: ${this.formatBytes(stats.totalSize)}\n` +

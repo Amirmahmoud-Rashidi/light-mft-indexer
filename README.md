@@ -9,6 +9,7 @@ file search / disk-usage tools to AI assistants through an MCP server.
 - **Instant search** by name, path, file type, size, modification date, hidden/system over a local SQLite index; results are paged (50 per page), never truncated
 - **Recursive directory sizes** ("what is eating my disk?")
 - **MCP server** (stdio) with 10 tools, **CLI** for the same operations
+- **Scoped indexing**: `--only` / `--exclude` by path or name pattern, for a drive too large to fully index or when only a few locations matter
 - **No compiler needed**: native access uses [koffi](https://koffi.dev) (prebuilt binaries). No Visual Studio, no node-gyp.
 
 ## Requirements
@@ -35,6 +36,32 @@ node dist\cli\index.js largest C --type dirs
 Indexes are stored in `%LOCALAPPDATA%\mft-indexer\mft-index-<DRIVE>.db`
 (override with the `MFT_INDEXER_DATA_DIR` environment variable).
 
+### Indexing only part of a drive: `--only` / `--exclude`
+
+By default `index` covers the whole drive (fastest, and the right choice for most drives). Two options
+narrow that, for a drive too large to fully index or when only a few locations actually matter:
+
+```bat
+:: skip a few locations, index everything else
+node dist\cli\index.js index C --exclude "C:\Windows" --exclude "node_modules" --exclude "*.tmp"
+
+:: index only these locations (much smaller, faster-to-query database than a full index)
+node dist\cli\index.js index C --only "C:\Projects" --only "C:\Users\me\Documents"
+```
+
+Only one of `--only` / `--exclude` may be given per index. Each entry is either:
+- a **path** (contains `\` or `/`): covers that path and everything below it, e.g. `"C:\Users\me\Downloads"`
+  (the drive letter may be omitted: `"Users\me\Downloads"` is anchored at the drive being indexed);
+- a **name pattern** (anything else, `*`/`?` wildcards allowed): matched against a bare file or directory
+  name wherever it occurs, e.g. `"node_modules"`, `"*.tmp"`, `"$Recycle.Bin"`. A pattern that matches a
+  *directory* excludes/keeps everything below it too.
+
+The `$MFT` is still read in one full sequential pass either way (scope does not change how the disk is
+read); scope only changes what ends up in the database, so a scoped index is smaller and its queries are
+faster, and `--exclude`/`--only` can be combined with `--no-hidden`/`--no-system` in the same run.
+`report`-equivalent output (`get_index_stats`, or the completion message from `index`) states the active
+scope, so it's clear when an index does not cover the whole drive.
+
 ## MCP configuration
 
 Example (`claude_desktop_config.json` or any MCP client):
@@ -56,7 +83,7 @@ search tools work from the index and return a clear error if the drive has not b
 
 | Tool | Purpose |
 |------|---------|
-| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator). Leave `includeHidden`/`includeSystem` at their default (`true`): hidden and system files (`hiberfil.sys`, `pagefile.sys`, `$MFT`, ...) are filtered at search time, not at index time |
+| `index_drive` | Build/refresh the index of an NTFS drive (needs Administrator). Leave `includeHidden`/`includeSystem` at their default (`true`): hidden and system files (`hiberfil.sys`, `pagefile.sys`, `$MFT`, ...) are filtered at search time, not at index time. Optional `only`/`exclude` (arrays of paths and/or name patterns, only one of the two) restrict what gets indexed - see "Indexing only part of a drive" above |
 | `search_files` | General search: name/path text and any combination of type, size range, date range, hidden/system |
 | `search_by_size` | Files in a size range (either bound optional), largest first |
 | `search_by_date` | Entries modified in a date range (either bound optional), newest first |

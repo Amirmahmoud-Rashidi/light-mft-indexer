@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import { getIndexDbPath, normalizeDriveLetter } from './drive';
 import { extensionOf, resolveTypes } from './file-types';
 import { createMFTParser } from './parser';
+import { IndexScope, buildScope, isEmptyScope, nameInScope, pathInScope } from './scope';
 import {
   EntryFilter,
   FileAttributes,
@@ -15,6 +16,7 @@ import {
   MFTRecordFlags,
   PAGE_SIZE,
   Page,
+  IndexScopeInfo,
   ParsedRecord,
   SortOrder,
 } from './types';
@@ -166,15 +168,21 @@ export class MFTIndexer extends EventEmitter {
   // ---- indexing ----------------------------------------------------------------------------
   async index(overrides: IndexOptions = {}): Promise<IndexStats> {
     if (this.isIndexing) throw new Error('Indexing already in progress');
-    this.isIndexing = true;
     const options = { ...this.options, ...stripUndefined(overrides), driveLetter: this.driveLetter };
     const batchSize = Math.max(1, options.batchSize || 1000);
     const startTime = Date.now();
-
-    // Opening the volume needs Administrator; do it first so a failure leaves the old index intact.
-    const parser = this.openParser(this.driveLetter);
+    // Validate before flipping isIndexing: a bad --only/--exclude combination must not leave the
+    // indexer permanently reporting "already in progress" on every later call.
+    const scope = buildScope(this.driveLetter, options.only, options.exclude);
+    this.isIndexing = true;
+    let parser: ParserLike | undefined;
     try {
-      this.emit('start', { driveLetter: this.driveLetter });
+      // Opening the volume needs Administrator; do it before touching the database, so a failure
+      // (including "not Windows" / "access denied") leaves the previous index intact. Doing this
+      // inside try/finally (rather than before it) means isIndexing is always reset on failure too -
+      // otherwise the indexer would be stuck reporting "already in progress" forever.
+      parser = this.openParser(this.driveLetter);
+      this.emit('start', { driveLetter: this.driveLetter, scope: scope.mode === 'none' ? undefined : { mode: scope.mode, entries: scope.raw } });
       this.db.pragma('synchronous = OFF');
       this.db.pragma('journal_mode = MEMORY');
       this.db.exec('DELETE FROM files; DELETE FROM meta;');
@@ -186,17 +194,16 @@ export class MFTIndexer extends EventEmitter {
          creation_time, modification_time, access_time, mft_modification_time,
          allocated_size, real_size, file_attributes, flags, is_directory)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const insertOne = (r: ParsedRecord, isDir: boolean) =>
+        insert.run(
+          r.recordNumber, r.sequenceNumber, r.parentRecordNumber, r.fileName, isDir ? '' : extensionOf(r.fileName),
+          r.creationTime.getTime(), r.modificationTime.getTime(),
+          r.accessTime.getTime(), r.mftModificationTime.getTime(),
+          Number(r.allocatedSize), Number(r.realSize),
+          r.fileAttributes, r.flags, isDir ? 1 : 0
+        );
       const insertBatch = this.db.transaction((batch: ParsedRecord[]) => {
-        for (const r of batch) {
-          const isDir = (r.flags & MFTRecordFlags.DIRECTORY) !== 0;
-          insert.run(
-            r.recordNumber, r.sequenceNumber, r.parentRecordNumber, r.fileName, isDir ? '' : extensionOf(r.fileName),
-            r.creationTime.getTime(), r.modificationTime.getTime(),
-            r.accessTime.getTime(), r.mftModificationTime.getTime(),
-            Number(r.allocatedSize), Number(r.realSize),
-            r.fileAttributes, r.flags, isDir ? 1 : 0
-          );
-        }
+        for (const r of batch) insertOne(r, (r.flags & MFTRecordFlags.DIRECTORY) !== 0);
       });
 
       const dirs = new Map<number, DirAcc>();
@@ -207,6 +214,17 @@ export class MFTIndexer extends EventEmitter {
       };
       // Size info for files whose $DATA lives in an extension record (seen before or after the base record).
       const sizeFixes = new Map<number, { real: bigint; alloc: bigint }>();
+      // Directory records are always inserted immediately (needed to resolve every path, including
+      // out-of-scope ones). File records are inserted immediately when scope has no path component
+      // (the common, fast case: no scope, or a name-only pattern that needs no path knowledge) - or
+      // held in `pending` when a path prefix is involved, since path membership can only be decided
+      // once the file's ancestor chain of directory names is fully known.
+      // A name pattern can match a DIRECTORY anywhere in a file's ancestor chain (e.g. "node_modules"),
+      // not just the file's own name, so - like a path prefix - it can only be decided once every
+      // directory's name and parent are known. Both therefore defer file records to `pending` and are
+      // resolved together in a single pass over `dirs`, right after directory paths are built below.
+      const needsScopeCheck = !isEmptyScope(scope);
+      const pending: ParsedRecord[] = [];
 
       let totalFiles = 0;
       let totalDirectories = 0;
@@ -222,6 +240,17 @@ export class MFTIndexer extends EventEmitter {
         await new Promise<void>((resolve) => setImmediate(resolve)); // keep the event loop (MCP pings) alive
       };
 
+      /** Apply the file-accounting side effects (directory totals, running totals) for one kept file. */
+      const account = (rec: ParsedRecord): void => {
+        const size = Number(rec.realSize);
+        const cls = attrClass(rec.fileAttributes);
+        const p = acc(rec.parentRecordNumber);
+        p.size[cls] += size;
+        p.files[cls] += 1;
+        totalFiles++;
+        totalSize += size;
+      };
+
       for (const rec of parser.scan()) {
         if (++scanned % YIELD_EVERY === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -233,30 +262,34 @@ export class MFTIndexer extends EventEmitter {
 
         const isDirectory = (rec.flags & MFTRecordFlags.DIRECTORY) !== 0;
         if (isDirectory) {
-          // Directories are always indexed: children's paths depend on them.
+          // Directories are always indexed and always kept for path building, in or out of scope:
+          // children's paths (in or out of scope) depend on the full ancestor chain being known.
           const d = acc(rec.recordNumber);
           d.parent = rec.recordNumber === ROOT_RECORD ? undefined : rec.parentRecordNumber;
           d.name = rec.fileName;
           totalDirectories++;
-        } else {
-          if (!options.includeHidden && (rec.fileAttributes & FileAttributes.HIDDEN)) continue;
-          if (!options.includeSystem && (rec.fileAttributes & FileAttributes.SYSTEM)) continue;
-          const size = Number(rec.realSize);
-          const cls = attrClass(rec.fileAttributes);
-          const p = acc(rec.parentRecordNumber);
-          p.size[cls] += size;
-          p.files[cls] += 1;
-          totalFiles++;
-          totalSize += size;
+          batch.push(rec);
+          if (batch.length >= batchSize) await flush();
+          continue;
         }
 
-        batch.push(rec);
-        if (batch.length >= batchSize) await flush();
+        if (!options.includeHidden && (rec.fileAttributes & FileAttributes.HIDDEN)) continue;
+        if (!options.includeSystem && (rec.fileAttributes & FileAttributes.SYSTEM)) continue;
+
+        if (needsScopeCheck) {
+          pending.push(rec); // decided after directory paths are known, see below - no second MFT read needed
+        } else {
+          account(rec);
+          batch.push(rec);
+          if (batch.length >= batchSize) await flush();
+        }
       }
       await flush();
 
       // -- sizes for files whose $DATA is in an extension record ---------------------------------
-      if (sizeFixes.size > 0) {
+      // (applies to files inserted above; files still `pending` get their extension-record fix, if any,
+      // applied together with their own insert below, via the same sizeFixes map.)
+      if (sizeFixes.size > 0 && pending.length === 0) {
         const getFile = this.db.prepare('SELECT parent_record_number AS parent, real_size AS size, file_attributes AS attrs FROM files WHERE record_number = ? AND is_directory = 0');
         const setSize = this.db.prepare('UPDATE files SET real_size = ?, allocated_size = ? WHERE record_number = ?');
         this.db.transaction(() => {
@@ -298,6 +331,70 @@ export class MFTIndexer extends EventEmitter {
         return paths.get(id) ?? base;
       };
 
+      // -- resolve scoped files now that every directory's name/parent is known -----------------
+      //
+      // A directory is "flagged" if its own name matches a name pattern, or its resolved path matches a
+      // path entry. Once every directory up to the root is checked once (memoized in `flagged`), a file's
+      // scope membership is: its own name matches a pattern, OR any ancestor directory is flagged.
+      const flagged = new Map<number, boolean>();
+      const isFlaggedChain = (dirId: number | undefined): boolean => {
+        let cur = dirId;
+        const chain: number[] = [];
+        let result = false;
+        while (cur !== undefined) {
+          const known = flagged.get(cur);
+          if (known !== undefined) { result = known; break; }
+          const d = dirs.get(cur);
+          if (!d || d.name === undefined) break;
+          if ((scope.namePatterns.length > 0 && nameInScope(scope, d.name)) || pathInScope(scope, resolvePath(cur))) {
+            result = true;
+            break;
+          }
+          chain.push(cur);
+          cur = cur === ROOT_RECORD ? undefined : d.parent;
+        }
+        for (const id of chain) flagged.set(id, result);
+        return result;
+      };
+
+      if (pending.length > 0) {
+        const fix = sizeFixes;
+        const pendingBatch = this.db.transaction((recs: ParsedRecord[]) => {
+          for (const rec of recs) {
+            const ownNameMatches = scope.namePatterns.length > 0 && nameInScope(scope, rec.fileName);
+            const inScope = ownNameMatches || isFlaggedChain(rec.parentRecordNumber);
+            const keep = scope.mode === 'only' ? inScope : !inScope;
+            if (!keep) continue;
+            const sizeFix = fix.get(rec.recordNumber);
+            if (sizeFix) { rec.realSize = sizeFix.real; rec.allocatedSize = sizeFix.alloc; fix.delete(rec.recordNumber); }
+            account(rec);
+            insertOne(rec, false);
+          }
+        });
+        pendingBatch(pending);
+        this.emit('progress', { files: totalFiles, directories: totalDirectories, size: String(totalSize) });
+
+        // any extension-record fix left over belongs to a file that was resolved (and inserted) above
+        // before its fix arrived is impossible (fixes are applied at insert time here); remaining entries
+        // are for files that were dropped by scope, or - if scope was empty - already handled earlier.
+        if (fix.size > 0 && needsScopeCheck) {
+          const getFile = this.db.prepare('SELECT parent_record_number AS parent, real_size AS size, file_attributes AS attrs FROM files WHERE record_number = ? AND is_directory = 0');
+          const setSize = this.db.prepare('UPDATE files SET real_size = ?, allocated_size = ? WHERE record_number = ?');
+          this.db.transaction(() => {
+            for (const [recordNumber, sizeFix] of fix) {
+              const row = getFile.get(recordNumber) as { parent: number; size: number; attrs: number } | undefined;
+              if (!row) continue; // file was dropped by scope
+              const newSize = Number(sizeFix.real);
+              const delta = newSize - row.size;
+              setSize.run(newSize, Number(sizeFix.alloc), recordNumber);
+              const p = acc(row.parent);
+              p.size[attrClass(row.attrs)] += delta;
+              totalSize += delta;
+            }
+          })();
+        }
+      }
+
       // -- recursive directory sizes ---------------------------------------------------------------
       for (const [id, d] of dirs) {
         if (d.files.every((n) => n === 0) && d.size.every((n) => n === 0)) continue;
@@ -335,6 +432,7 @@ export class MFTIndexer extends EventEmitter {
         indexedAt: new Date(),
         duration: Date.now() - startTime,
         driveLetter: this.driveLetter,
+        scope: scope.mode === 'none' ? undefined : { mode: scope.mode, entries: scope.raw },
       };
       this.saveStats(stats);
       this.emit('complete', stats);
@@ -343,7 +441,7 @@ export class MFTIndexer extends EventEmitter {
       this.isIndexing = false;
       this.db.pragma('synchronous = NORMAL');
       this.db.pragma('journal_mode = DELETE');
-      parser.close();
+      parser?.close();
     }
   }
 
@@ -355,6 +453,8 @@ export class MFTIndexer extends EventEmitter {
       put.run('totalSize', s.totalSize.toString());
       put.run('indexedAt', s.indexedAt.toISOString());
       put.run('duration', String(s.duration));
+      put.run('scopeMode', s.scope?.mode ?? 'none');
+      put.run('scopeEntries', JSON.stringify(s.scope?.entries ?? []));
     })();
   }
 
@@ -368,6 +468,7 @@ export class MFTIndexer extends EventEmitter {
     const rows = this.db.prepare('SELECT key, value FROM meta').all() as { key: string; value: string }[];
     if (rows.length === 0) return null;
     const m = new Map(rows.map((r) => [r.key, r.value]));
+    const scopeMode = (m.get('scopeMode') ?? 'none') as IndexScopeInfo['mode'];
     return {
       totalFiles: Number(m.get('totalFiles') ?? 0),
       totalDirectories: Number(m.get('totalDirectories') ?? 0),
@@ -375,6 +476,7 @@ export class MFTIndexer extends EventEmitter {
       indexedAt: new Date(m.get('indexedAt') ?? 0),
       duration: Number(m.get('duration') ?? 0),
       driveLetter: this.driveLetter,
+      scope: scopeMode === 'none' ? undefined : { mode: scopeMode, entries: JSON.parse(m.get('scopeEntries') ?? '[]') },
     };
   }
 

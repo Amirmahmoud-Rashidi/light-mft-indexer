@@ -211,6 +211,13 @@ export interface BootSector {
 
 export interface IndexOptions {
   driveLetter?: string;
+  /**
+   * Restrict indexing to these paths/name-patterns, or exclude them (only one of the two may be set).
+   * A path entry (contains \\ or /) covers itself and everything below it; anything else is a glob
+   * pattern (*, ?) matched against a bare file/directory name, e.g. "node_modules", "*.tmp".
+   */
+  only?: string[];
+  exclude?: string[];
   /** Index files with the Hidden attribute (default: true). */
   includeHidden?: boolean;
   /** Index files with the System attribute, e.g. hiberfil.sys, pagefile.sys, $MFT (default: true). */
@@ -227,6 +234,8 @@ export interface IndexStats {
   indexedAt: Date;
   duration: number;
   driveLetter: string;
+  /** Set when the index was built with --only / --exclude; absent for a full, unrestricted index. */
+  scope?: IndexScopeInfo;
 }
 
 export interface DiskUsage {
@@ -334,3 +343,9 @@ export interface FindCriteria extends EntryFilter {
 }
 
 export type SortOrder = 'relevance' | 'size' | 'date';
+
+/** What scope (if any) the current index was built with - persisted so queries/re-index can report it. */
+export interface IndexScopeInfo {
+  mode: 'none' | 'exclude' | 'only';
+  entries: readonly string[];
+}

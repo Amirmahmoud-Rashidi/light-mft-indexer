@@ -216,4 +216,30 @@ describe('MCP server', () => {
       expect(t).toMatch(/Any other format: pass its extension/);
     });
   });
+
+  describe('index_drive scope (only/exclude)', () => {
+    it('advertises only/exclude in its schema', async () => {
+      const tools = (await client.listTools()).tools;
+      const indexDrive = tools.find((t) => t.name === 'index_drive')!;
+      expect(Object.keys(indexDrive.inputSchema.properties as object)).toEqual(
+        expect.arrayContaining(['driveLetter', 'includeHidden', 'includeSystem', 'batchSize', 'only', 'exclude'])
+      );
+    });
+
+    it('rejects only+exclude together with a clear tool error before touching the volume (no Administrator/Windows needed to see this)', async () => {
+      // buildScope() validates before the volume is opened, so this error surfaces even off-Windows -
+      // unlike other index_drive failures, which need a real volume and are covered by the platform-check test below.
+      const r: any = await client.callTool({ name: 'index_drive', arguments: { driveLetter: 'C', only: ['C:\\\\a'], exclude: ['C:\\\\b'] } });
+      expect(r.isError).toBe(true);
+      expect(text(r)).toBe('Error: Use either "only" or "exclude", not both.');
+      expect((await client.listTools()).tools.length).toBeGreaterThan(0); // server survives
+    });
+
+    it('a normal (Windows-only) index_drive call still fails at the platform check, scope aside', async () => {
+      if (process.platform === 'win32') return;
+      const r: any = await client.callTool({ name: 'index_drive', arguments: { driveLetter: 'C', only: ['C:\\\\Projects'] } });
+      expect(r.isError).toBe(true);
+      expect(text(r)).toMatch(/needs Windows/);
+    });
+  });
 });
